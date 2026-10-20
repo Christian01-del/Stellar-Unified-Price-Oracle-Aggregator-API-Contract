@@ -187,6 +187,7 @@ Source: `contracts/price-oracle/src/load_v2_tests.rs`. Each scenario prints
 
 ## Further Reading
 
+- [Worst-Case Source-Count Benchmark](./source-count-benchmark.md)
 - [Source Onboarding Guide](./source-onboarding.md)
 - [Monitoring Setup Guide](./monitoring-setup.md)
 - [Soroban Budget Docs](https://developers.stellar.org/docs/learn/smart-contract-internals/fees-and-metering)

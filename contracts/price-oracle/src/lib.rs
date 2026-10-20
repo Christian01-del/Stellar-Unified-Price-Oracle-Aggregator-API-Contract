@@ -7371,3 +7371,6 @@ mod issues_483_486_tests;
 
 #[cfg(test)]
 mod issues_487_490_tests;
+
+#[cfg(test)]
+mod source_count_benchmark_tests;
