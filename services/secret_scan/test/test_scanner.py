@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from datetime import date, timedelta
 from pathlib import Path
@@ -115,7 +116,7 @@ def test_scanning_covers_source_config_and_ci_files(tmp_path: Path):
     ):
         (tmp_path / rel).write_text(secret, encoding="utf-8")
     findings = scan_tree([tmp_path])
-    assert {str(Path(f.path).relative_to(tmp_path)) for f in findings} == {
+    assert {Path(f.path).relative_to(tmp_path).as_posix() for f in findings} == {
         "src/lib.rs",
         ".github/workflows/ci.yml",
         "config/canary-assets.txt",
@@ -202,7 +203,7 @@ def _git_repo(tmp_path: Path) -> Path:
         "GIT_AUTHOR_EMAIL": "t@example.invalid",
         "GIT_COMMITTER_NAME": "t",
         "GIT_COMMITTER_EMAIL": "t@example.invalid",
-        "PATH": "/usr/bin:/bin:/usr/local/bin",
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin:/usr/local/bin"),
         "HOME": str(tmp_path),
     }
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True, env=env)
@@ -216,7 +217,7 @@ def _commit(repo: Path, name: str, body: str) -> None:
         "GIT_AUTHOR_EMAIL": "t@example.invalid",
         "GIT_COMMITTER_NAME": "t",
         "GIT_COMMITTER_EMAIL": "t@example.invalid",
-        "PATH": "/usr/bin:/bin:/usr/local/bin",
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin:/usr/local/bin"),
         "HOME": str(repo),
     }
     subprocess.run(["git", "add", name], cwd=repo, check=True, env=env)
@@ -232,7 +233,7 @@ def test_staged_scan_catches_a_secret_before_it_is_committed(tmp_path: Path):
         ["git", "add", "leak.rs"],
         cwd=repo,
         check=True,
-        env={"PATH": "/usr/bin:/bin", "HOME": str(repo)},
+        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(repo)},
     )
     findings = scan_staged(repo)
     assert len(findings) == 1
@@ -243,7 +244,7 @@ def test_history_scan_reports_a_secret_that_was_already_removed(tmp_path: Path):
     repo = _git_repo(tmp_path)
     _commit(repo, "leak.toml", f'aws_key = "{FAKE_AWS_KEY}"\n')
     (repo / "leak.toml").unlink()
-    env = {"PATH": "/usr/bin:/bin", "HOME": str(repo)}
+    env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid", "PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(repo)}
     subprocess.run(["git", "add", "-A"], cwd=repo, check=True, env=env)
     subprocess.run(["git", "commit", "-q", "-m", "remove"], cwd=repo, check=True, env=env)
 
