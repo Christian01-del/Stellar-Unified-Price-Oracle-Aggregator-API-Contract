@@ -7380,3 +7380,6 @@ mod endpoint_budget_tests;
 
 #[cfg(test)]
 mod history_retention_benchmark_tests;
+
+#[cfg(test)]
+mod ledger_burst_capacity_tests;
