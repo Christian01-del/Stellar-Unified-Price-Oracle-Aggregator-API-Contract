@@ -7374,3 +7374,6 @@ mod issues_487_490_tests;
 
 #[cfg(test)]
 mod source_count_benchmark_tests;
+
+#[cfg(test)]
+mod endpoint_budget_tests;

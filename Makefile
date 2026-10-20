@@ -11,6 +11,7 @@
 #   gas-gate  - adversarial gas-budget regression gates (#419)
 #   load-test - adversarial load test v2 (#413)
 #   source-count-bench - worst-case configured source-count benchmark (#693)
+#   endpoint-budgets   - per-endpoint compute and storage budget gate (#692)
 #   mutation-gate       - mutation gate self-test, no cargo-mutants needed (#520)
 #   mutation-per-module - per-module mutation scores and thresholds (#520)
 #   hermetic           - hermetic integration harness, verifies determinism (#519)
@@ -32,7 +33,8 @@
 .PHONY: all build test lint fmt check clean watch gas-gate load-test \
         mutation-gate mutation-per-module hermetic sast secret-scan \
         check-pins reproducible-build security rpc-gate indexer-trust \
-        tx-review-gate redaction-gate trust-boundary source-count-bench
+        tx-review-gate redaction-gate trust-boundary source-count-bench \
+        endpoint-budgets
 
 all: build test
 
@@ -55,6 +57,10 @@ load-test:
 # Worst-case configured source-count benchmark (docs/source-count-benchmark.md)
 source-count-bench:
 	cargo test -p price-oracle --lib source_count_bench -- --nocapture --test-threads=1
+
+# Per-endpoint compute and storage budget gate (docs/endpoint-budgets.md)
+endpoint-budgets:
+	cargo test -p price-oracle --lib endpoint_budget -- --nocapture
 
 # Verify the mutation gate's own logic (scoring, thresholds, waivers).
 # Needs only bash + jq, so it runs in seconds and needs no cargo-mutants.
