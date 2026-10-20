@@ -189,6 +189,7 @@ Source: `contracts/price-oracle/src/load_v2_tests.rs`. Each scenario prints
 
 - [Worst-Case Source-Count Benchmark](./source-count-benchmark.md)
 - [Per-Endpoint Compute and Storage Budgets](./endpoint-budgets.md)
+- [Worst-Case History Retention Benchmark](./history-retention-benchmark.md)
 - [Source Onboarding Guide](./source-onboarding.md)
 - [Monitoring Setup Guide](./monitoring-setup.md)
 - [Soroban Budget Docs](https://developers.stellar.org/docs/learn/smart-contract-internals/fees-and-metering)
