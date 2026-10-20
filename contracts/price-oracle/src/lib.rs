@@ -2804,7 +2804,8 @@ impl PriceOracleContract {
     /// Returns all historical price snapshots for an asset within a ledger range.
     ///
     /// Only ledgers that actually contain a snapshot are included in the result.
-    /// The range `[start_ledger, end_ledger]` must not exceed `max_history_length`.
+    /// The inclusive range may cover at most 50 ledger numbers and must not exceed
+    /// `max_history_length`.
     ///
     /// # Arguments
     ///
@@ -2822,6 +2823,7 @@ impl PriceOracleContract {
     ///
     /// * [`ErrorCode::AssetNotRegistered`] — if `asset` is not registered.
     /// * [`ErrorCode::NoData`] — if `end_ledger - start_ledger` exceeds `max_history_length`.
+    /// * [`ErrorCode::RecordsLimitExceeded`] — if the inclusive ledger range exceeds 50.
     pub fn get_historical_prices(
         env: Env,
         asset: Address,
@@ -2841,8 +2843,8 @@ impl PriceOracleContract {
     ///
     /// # Returns
     ///
-    /// `(entries, next_cursor)` — `next_cursor` is `Some(ledger)` to request the next page,
-    /// or `None` once all recorded entries have been returned.
+    /// `(entries, next_cursor)` — `next_cursor` is the first unreturned ledger, inclusive;
+    /// pass it unchanged to request the next page. It is `None` after the final page.
     ///
     /// # Errors
     ///
@@ -3208,6 +3210,8 @@ impl PriceOracleContract {
     }
 
     /// Returns the list of all registered assets as SEP-40 [`Asset`] values (SEP-40 `assets`).
+    /// The complete-list endpoint is capped at 100 assets; use
+    /// [`assets_paginated`](Self::assets_paginated) for larger registries.
     ///
     /// # Arguments
     ///
@@ -3216,15 +3220,52 @@ impl PriceOracleContract {
     /// # Returns
     ///
     /// A [`Vec`] of [`Asset::Stellar`] wrapping each registered asset address.
+    ///
+    /// # Errors
+    ///
+    /// * [`ErrorCode::RecordsLimitExceeded`] — if more than 100 assets are registered;
+    ///   use [`assets_paginated`](Self::assets_paginated) instead.
     pub fn assets(env: Env) -> Vec<Asset> {
         enter_reentrancy_guard(&env);
         let registered = read_registered_assets(&env);
+        if registered.len() > assets::MAX_ASSET_QUERY_SIZE {
+            panic_with_error!(&env, ErrorCode::RecordsLimitExceeded);
+        }
         let mut result: Vec<Asset> = Vec::new(&env);
         for i in 0..registered.len() {
             result.push_back(Asset::Stellar(registered.get_unchecked(i)));
         }
         exit_reentrancy_guard(&env);
         result
+    }
+
+    /// Returns one page of registered assets in registration order.
+    ///
+    /// `cursor` is the last asset returned by the previous page; pass `None`
+    /// to start. A removed cursor is rejected so clients can restart rather
+    /// than silently skipping entries. `limit` must be in `1..=50`.
+    ///
+    /// Returns `(assets, next_cursor)`. Continue with the returned cursor
+    /// until it is `None`.
+    ///
+    /// # Errors
+    ///
+    /// * [`ErrorCode::InvalidPageSize`] — `limit` is `0` or exceeds 50.
+    /// * [`ErrorCode::InvalidPageCursor`] — the cursor asset is no longer registered.
+    pub fn assets_paginated(
+        env: Env,
+        cursor: Option<Address>,
+        limit: u32,
+    ) -> (Vec<Asset>, Option<Address>) {
+        enter_reentrancy_guard(&env);
+        let (registered, next_cursor) =
+            assets::get_registered_assets_paginated(&env, cursor, limit);
+        let mut result: Vec<Asset> = Vec::new(&env);
+        for i in 0..registered.len() {
+            result.push_back(Asset::Stellar(registered.get_unchecked(i)));
+        }
+        exit_reentrancy_guard(&env);
+        (result, next_cursor)
     }
 
     /// Returns the price resolution window in seconds (SEP-40 `resolution`).
@@ -3361,12 +3402,17 @@ impl PriceOracleContract {
     ///
     /// * `env` - The Soroban execution environment.
     /// * `asset` - The asset to query. Non-`Stellar` variants always return `None`.
-    /// * `records` - Maximum number of price records to return.
+    /// * `records` - Maximum number of price records to return (at most 50).
     ///
     /// # Returns
     ///
     /// `Some(`[`Vec<PriceData>`]`)` containing up to `records` entries in reverse
     /// chronological order, or `None`.
+    ///
+    /// # Errors
+    ///
+    /// * [`ErrorCode::RecordsLimitExceeded`] — if `records` exceeds either the configured
+    ///   history length or the 50-record response limit.
     pub fn prices(env: Env, asset: Asset, records: u32) -> Option<Vec<PriceData>> {
         enter_reentrancy_guard(&env);
         let result = prices::prices(&env, asset, records);
@@ -6102,9 +6148,16 @@ impl PriceOracleContract {
         storage::read_oracle_sources(&env).sources
     }
 
-    /// Returns every registered asset, in registration order.
+    /// Returns every registered asset, in registration order (up to 100 assets).
+    ///
+    /// Returns [`ErrorCode::RecordsLimitExceeded`] when the registry is larger;
+    /// use [`assets_paginated`](Self::assets_paginated) instead.
     pub fn list_assets(env: Env) -> Vec<Address> {
-        read_registered_assets(&env)
+        let registered = read_registered_assets(&env);
+        if registered.len() > assets::MAX_ASSET_QUERY_SIZE {
+            panic_with_error!(&env, ErrorCode::RecordsLimitExceeded);
+        }
+        registered
     }
 
     /// Returns a page of historical price entries for `asset`, starting at
