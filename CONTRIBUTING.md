@@ -104,6 +104,8 @@ Privileged access (Triager and above) expires automatically after **90 days of i
 2. The contributor is notified and may request reinstatement by demonstrating current activity.
 
 A dry run of the expiry process is performed quarterly by a Core Maintainer, with results documented as an issue.
+The same quarterly review covers deployment, monitoring, source and treasury access for humans and
+automation; see [docs/security/access-review.md](docs/security/access-review.md).
 
 ### Removal and Demotion
 
