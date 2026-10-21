@@ -2,13 +2,120 @@
 //!
 //! Provides visibility into source performance metrics including accuracy, timeliness,
 //! uptime, and reputation trajectory over configurable rolling windows.
+//!
+//! Also exposes a consumer-safe explanation view (#706) describing which eligible
+//! submissions contributed to an aggregate and why others were excluded.
 
-use soroban_sdk::{Address, Env};
+use soroban_sdk::{contracttype, Address, Env, Vec};
 
 use crate::events::SourceAnalyticsReportedEvent;
 use crate::reputation;
 use crate::storage::LEDGER_BUMP;
 use crate::types::{DataKey, SourceAnalytics};
+
+/// Reason a submission was excluded from an aggregate.
+///
+/// These are consumer-safe: they never reveal private source credentials.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+#[allow(dead_code)]
+pub enum ExclusionReason {
+    /// Submission was included in the aggregate.
+    Included = 0,
+    /// Source is not eligible (e.g. not registered / not active).
+    Ineligible = 1,
+    /// Submission was stale relative to the aggregation round.
+    Stale = 2,
+    /// Submission was outside the accepted deviation band.
+    OutOfBand = 3,
+    /// Source had no recorded submission for the round.
+    Missing = 4,
+}
+
+/// Per-source explanation of an inclusion/exclusion decision.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceContribution {
+    /// Source address (public on-chain identity, not a credential).
+    pub source: Address,
+    /// Whether this source contributed to the aggregate.
+    pub included: bool,
+    /// Machine-readable reason for the decision.
+    pub reason: ExclusionReason,
+}
+
+/// Consumer-safe explanation of an aggregate's contributing sources.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AggregateExplanation {
+    /// Number of sources that contributed to the aggregate.
+    pub included_count: u32,
+    /// Number of sources that were excluded.
+    pub excluded_count: u32,
+    /// Per-source decisions, in deterministic input order.
+    pub contributions: Vec<SourceContribution>,
+}
+
+/// Builds a consumer-safe explanation of which eligible submissions contributed
+/// to an aggregate and why others were excluded.
+///
+/// # Arguments
+/// * `env` - Execution environment.
+/// * `sources` - Candidate sources, in deterministic order.
+/// * `eligible` - Parallel flags: `true` if the source was eligible for the round.
+/// * `included` - Parallel flags: `true` if the source contributed to the aggregate.
+///
+/// # Returns
+/// An [`AggregateExplanation`] with one [`SourceContribution`] per candidate.
+/// The decision is deterministic: given the same inputs the same explanation is
+/// produced, and no private source credentials are ever exposed.
+pub fn explain_aggregate(
+    env: &Env,
+    sources: Vec<Address>,
+    eligible: Vec<bool>,
+    included: Vec<bool>,
+) -> AggregateExplanation {
+    let mut contributions: Vec<SourceContribution> = Vec::new(env);
+    let mut included_count: u32 = 0;
+    let mut excluded_count: u32 = 0;
+
+    let len = sources.len();
+    let mut i: u32 = 0;
+    while i < len {
+        let source = sources.get(i).unwrap();
+        let is_eligible = eligible.get(i).unwrap_or(false);
+        let is_included = included.get(i).unwrap_or(false);
+
+        let (did_include, reason) = if !is_eligible {
+            (false, ExclusionReason::Ineligible)
+        } else if is_included {
+            (true, ExclusionReason::Included)
+        } else {
+            (false, ExclusionReason::OutOfBand)
+        };
+
+        if did_include {
+            included_count += 1;
+        } else {
+            excluded_count += 1;
+        }
+
+        contributions.push_back(SourceContribution {
+            source,
+            included: did_include,
+            reason,
+        });
+
+        i += 1;
+    }
+
+    AggregateExplanation {
+        included_count,
+        excluded_count,
+        contributions,
+    }
+}
 
 /// Computes and returns analytics for a source over the last `num_rounds` submissions.
 ///
