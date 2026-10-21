@@ -171,6 +171,7 @@ lives elsewhere. Stellar network data availability is likewise out of scope.
 
 ## 8. Related
 
+* [`docs/capacity-headroom-review.md`](capacity-headroom-review.md) — capacity headroom review and expansion triggers from observed traffic (#704)
 * [`docs/gas-budget.md`](gas-budget.md) — the per-endpoint CPU budgets used as drivers
 * [`docs/runbook.md`](runbook.md) — what to do when a capacity alert pages
 * [`docs/SLA.md`](SLA.md) — the 60 s freshness target behind the lag budget
