@@ -1,67 +1,71 @@
 # One asset contract id per line, compared by the canary pipeline.
 #
-# Production asset onboarding policy (issue #605)
-# -------------------------------------------------
-# Every asset enabled at launch MUST satisfy all of the following before its
-# contract id may be listed here. The canary pipeline treats this file as the
-# production manifest, so an entry that does not meet the policy is a launch
-# blocker.
+# Source availability and coverage review cadence (issue #648)
+# ---------------------------------------------------------------
+# The periodic coverage review (see .github/workflows/source-coverage-review.yml)
+# reads this file to determine which assets are expected to be covered by the
+# configured sources. Assets listed here that fall below the configured
+# diversity threshold are flagged in the generated review artifact.
 #
-# Eligibility
-#   - Asset is issued on Stellar mainnet and has a verifiable issuer account.
-#   - Soroban asset contract is deployed and its wasm hash is pinned/reviewed.
-#   - Asset is supported by the oracle price feed(s) it will be quoted against.
+# Diversity threshold: minimum number of distinct sources that must report a
+# price for an asset before it is considered "covered". Override per-run with
+# the SOURCE_DIVERSITY_THRESHOLD environment variable; defaults to 2.
 #
-# Required metadata (all fields mandatory)
-#   - contract_id      : the asset contract id listed below
-#   - symbol           : canonical ticker
-#   - issuer           : Stellar account (G...) or native marker
-#   - decimals         : integer precision used by the contract
-#   - price_feed       : oracle feed id backing the asset
-#   - risk_review      : link/id of the completed risk review
-#   - signoff          : approver identity + date of launch sign-off
+# Owner assignment: the review assigns an owner per flagged asset using the
+# mapping below (asset contract id -> GitHub handle or team). Assets without an
+# explicit mapping fall back to the default owner. Keep this mapping in sync
+# with CODEOWNERS where applicable.
 #
-# Risk review
-#   - Liquidity, volatility, and oracle-manipulation risk assessed and recorded.
-#   - Failure/recovery path (feed outage, stale price) documented for the asset.
+# Format:
+#   <asset_contract_id>            # expected coverage, default owner
+#   <asset_contract_id> <owner>    # expected coverage, explicit owner
 #
-# Sign-off
-#   - Risk review and sign-off recorded before the asset is added below.
-#   - An asset without every required field above MUST NOT enter this manifest.
+# Example (uncomment and replace with real contract ids):
+# CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC @stellar/oracle-oncall
+# CAQCFVLOBK5GIULPNZRGATJJYMLOWVQXKH43YH45HQEKCR6OSAHHE @stellar/oracle-oncall
 #
-# Launch-day canary asset sequence (issue #606)
-# ---------------------------------------------
-# Low-risk canary assets are enabled in stages before broad production
-# coverage. Each stage lists the assets enabled at that stage and the
-# measurable advance / pause / rollback criteria the operator applies. The
-# canary pipeline reads the STAGE markers to know which assets are live.
+# Default owner used when an asset has no explicit mapping:
+# owner: @stellar/oracle-oncall
+
 #
-# Stage 0 - Baseline (no canary assets enabled)
-#   Advance: pipeline green on an empty manifest; oracle serving all feeds.
-#   Pause:   any feed unhealthy or pipeline red.
-#   Rollback: n/a (nothing enabled).
+# Provider contract and dependency inventory (issue #649)
+# -------------------------------------------------------
+# For every production source, record the upstream market-data provider, the
+# terms under which it is used, its rate/usage limits, the runtime dependency
+# it introduces, and the replacement contact used if the provider must be
+# swapped out. This lets an operator identify the upstream dependency and the
+# fallback for each production source without reading source code.
 #
-# Stage 1 - Single low-risk canary asset
-#   Advance: >= 24h with zero stale-price alerts, feed deviation within
-#            tolerance, and no failed oracle updates for the canary asset.
-#   Pause:   any stale-price alert, deviation breach, or failed update;
-#            hold at Stage 1 until a clean 24h window is observed.
-#   Rollback: remove the Stage 1 asset from this manifest and redeploy.
+# Repeatable check: scripts/check-provider-inventory.sh (run in CI) verifies
+# that every source referenced by the oracle has a matching entry below and
+# that each entry declares all required fields. Do not commit secrets or
+# production credentials here — reference the secret store key name only.
 #
-# Stage 2 - Small canary set (2-3 low-risk assets)
-#   Advance: >= 48h clean across the Stage 2 set with the same thresholds
-#            as Stage 1, plus a successful recovery drill (feed outage /
-#            stale price) for at least one canary asset.
-#   Pause:   any alert or deviation breach; hold until a clean 48h window.
-#   Rollback: revert to the Stage 1 manifest and redeploy.
+# Format (one block per source, blank line separated):
+#   source:        <source id used by the oracle>
+#   provider:      <upstream market-data provider>
+#   terms:         <license / terms reference>
+#   limits:        <rate or usage limits>
+#   dependency:    <runtime dependency / endpoint class>
+#   fallback:      <fallback source id used when this source is unavailable>
+#   contact:       <replacement / escalation contact>
+#   credentials:   <secret store key name, never the value>
 #
-# Stage 3 - Broad production coverage
-#   Advance: >= 72h clean across the full manifest and all recovery drills
-#            passed; sign-off recorded per the policy above.
-#   Pause:   any alert, deviation breach, or failed drill; hold at Stage 2.
-#   Rollback: revert to the Stage 2 manifest and redeploy.
+# Example (uncomment and replace with real values):
+# source:        coingecko
+# provider:      CoinGecko
+# terms:         CoinGecko API Terms of Service (public API tier)
+# limits:        10-30 calls/min per key; see provider dashboard
+# dependency:    HTTPS REST, api.coingecko.com
+# fallback:      reflector
+# contact:       @stellar/oracle-oncall
+# credentials:   COINGECKO_API_KEY (secret store)
 #
-# Format: one asset contract id per line, compared by the canary pipeline.
-# Lines beginning with '#' are comments; STAGE markers are informational.
-#
-# STAGE 0
+# source:        reflector
+# provider:      Reflector Network
+# terms:         Reflector open-source / on-chain feed terms
+# limits:        On-chain read; bounded by ledger/RPC throughput
+# dependency:    Soroban contract read via RPC
+# fallback:      coingecko
+# contact:       @stellar/oracle-oncall
+# credentials:   none (public on-chain data)

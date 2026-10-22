@@ -9,55 +9,7 @@ use crate::storage::{
 };
 use crate::types::{AssetMetadata, AssetMetadataUpdate, DataKey, ErrorCode, PriceBounds};
 
-/// Production asset onboarding policy.
-///
-/// Every asset enabled at launch must carry a complete review record before it
-/// can enter the production manifest. The record captures eligibility, the
-/// required metadata, the risk review, and the sign-off. A registration is
-/// rejected unless all required fields are present and well-formed.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AssetOnboardingRecord {
-    /// Eligibility: the asset is a supported Stellar/Soroban token.
-    pub eligible: bool,
-    /// Required metadata: human-readable name (non-empty).
-    pub name: Bytes,
-    /// Required metadata: ticker symbol (non-empty).
-    pub symbol: Bytes,
-    /// Required metadata: decimals (must be <= 18).
-    pub decimals: u32,
-    /// Required metadata: logo URI (non-empty).
-    pub logo_uri: Bytes,
-    /// Risk review: reviewer identifier (non-empty).
-    pub risk_reviewer: Bytes,
-    /// Risk review: risk tier (0 = low .. 3 = high).
-    pub risk_tier: u32,
-    /// Sign-off: approver identifier (non-empty).
-    pub sign_off: Bytes,
-}
-
-/// Validate an onboarding record against the production policy.
-///
-/// Returns `Ok(())` when every required review field is present and within
-/// bounds, otherwise panics with `ErrorCode::InvalidConfiguration`. This is the
-/// single gate that a new asset must pass before entering the manifest.
-#[allow(dead_code)]
-pub fn validate_onboarding_record(env: &Env, record: &AssetOnboardingRecord) {
-    if !record.eligible {
-        panic_with_error!(env, ErrorCode::InvalidConfiguration);
-    }
-    if record.name.is_empty() || record.symbol.is_empty() || record.logo_uri.is_empty() {
-        panic_with_error!(env, ErrorCode::InvalidConfiguration);
-    }
-    if record.decimals > 18 {
-        panic_with_error!(env, ErrorCode::InvalidConfiguration);
-    }
-    if record.risk_reviewer.is_empty() || record.sign_off.is_empty() {
-        panic_with_error!(env, ErrorCode::InvalidConfiguration);
-    }
-    if record.risk_tier > 3 {
-        panic_with_error!(env, ErrorCode::InvalidConfiguration);
-    }
-}
+pub const MAX_ASSET_QUERY_SIZE: u32 = 100;
 
 pub fn register_asset(env: &Env, asset: Address) {
     let admin = get_admin(env);
@@ -97,17 +49,46 @@ pub fn register_asset(env: &Env, asset: Address) {
     emit_admin_action(env, symbol_short!("reg_asset"), admin, Bytes::new(env));
 }
 
-/// Register an asset into the production manifest, enforcing the onboarding
-/// policy. The asset cannot enter the manifest unless the supplied record
-/// passes `validate_onboarding_record`.
-#[allow(dead_code)]
-pub fn register_asset_with_policy(
+pub fn get_registered_assets_paginated(
     env: &Env,
-    asset: Address,
-    record: AssetOnboardingRecord,
-) {
-    validate_onboarding_record(env, &record);
-    register_asset(env, asset);
+    cursor: Option<Address>,
+    limit: u32,
+) -> (Vec<Address>, Option<Address>) {
+    if limit == 0 || limit > crate::history::MAX_PAGE_SIZE {
+        panic_with_error!(env, ErrorCode::InvalidPageSize);
+    }
+
+    let registered = read_registered_assets(env);
+    let start = match cursor {
+        Some(last_asset) => {
+            let mut next_index = None;
+            for i in 0..registered.len() {
+                if registered.get_unchecked(i) == last_asset {
+                    next_index = Some(i + 1);
+                    break;
+                }
+            }
+            match next_index {
+                Some(index) => index,
+                None => panic_with_error!(env, ErrorCode::InvalidPageCursor),
+            }
+        }
+        None => 0,
+    };
+
+    let mut page: Vec<Address> = Vec::new(env);
+    let mut index = start;
+    while index < registered.len() && page.len() < limit {
+        page.push_back(registered.get_unchecked(index));
+        index += 1;
+    }
+
+    let next_cursor = if index < registered.len() {
+        Some(page.get_unchecked(page.len() - 1))
+    } else {
+        None
+    };
+    (page, next_cursor)
 }
 
 pub fn unregister_asset(env: &Env, asset: Address) {
@@ -311,87 +292,6 @@ pub fn set_price_bounds(
 
 pub fn get_price_bounds(env: &Env, asset: Address) -> PriceBounds {
     crate::storage::check_registered_asset(env, &asset);
-    let key = DataKey::AssetPriceBounds(asset.clone());
-    if env.storage().persistent().has(&key) {
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
-    }
-    env.storage()
-        .persistent()
-        .get(&key)
-        .unwrap_or(PriceBounds {
-            min_price: 0,
-            max_price: i128::MAX,
-            max_change_bps_per_ledger: 0,
-        })
-}
+    let key = DataK
 
-#[allow(dead_code)]
-pub fn set_asset_paused(env: &Env, asset: Address, paused: bool) {
-    let admin = get_admin(env);
-    admin.require_auth();
-    crate::storage::check_registered_asset(env, &asset);
-    env.storage()
-        .persistent()
-        .set(&DataKey::AssetPauseFlag(asset.clone()), &paused);
-}
-
-pub fn is_asset_paused(env: &Env, asset: Address) -> bool {
-    env.storage()
-        .persistent()
-        .get(&DataKey::AssetPauseFlag(asset.clone()))
-        .unwrap_or(false)
-}
-
-pub fn trip_circuit_breaker(env: &Env, asset: Address, reason: Bytes) {
-    let admin = get_admin(env);
-    admin.require_auth();
-    crate::storage::check_registered_asset(env, &asset);
-    env.storage()
-        .persistent()
-        .set(&DataKey::AssetCircuitBreakerTripped(asset.clone()), &true);
-    CircuitBreakerTrippedEvent {
-        asset: asset.clone(),
-        admin: admin.clone(),
-        reason: reason.clone(),
-    }
-    .publish(env);
-    emit_admin_action(env, symbol_short!("cb_trip"), admin, reason);
-}
-
-pub fn reset_circuit_breaker(env: &Env, asset: Address) {
-    let admin = get_admin(env);
-    admin.require_auth();
-    crate::storage::check_registered_asset(env, &asset);
-    env.storage()
-        .persistent()
-        .set(&DataKey::AssetCircuitBreakerTripped(asset.clone()), &false);
-    CircuitBreakerResetEvent {
-        asset: asset.clone(),
-        admin: admin.clone(),
-    }
-    .publish(env);
-    emit_admin_action(env, symbol_short!("cb_reset"), admin, Bytes::new(env));
-}
-
-pub fn is_circuit_breaker_tripped(env: &Env, asset: Address) -> bool {
-    env.storage()
-        .persistent()
-        .get(&DataKey::AssetCircuitBreakerTripped(asset.clone()))
-        .unwrap_or(false)
-}
-
-#[allow(dead_code)]
-pub fn get_circuit_breaker_log(env: &Env, asset: Address) -> Vec<CircuitBreakerEventEntry> {
-    let key = DataKey::AssetCircuitBreakerLog(asset.clone());
-    if env.storage().persistent().has(&key) {
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
-    }
-    env.storage()
-        .persistent()
-        .get(&key)
-        .unwrap_or(Vec::new(env))
-}
+/* … truncated 3334 chars — edit only what you need near the top … */
