@@ -42,9 +42,9 @@
 //! this vocabulary. Clients MUST handle every variant explicitly and treat any
 //! unknown future discriminant as `Unavailable` (fail safe).
 
-use soroban_sdk::{panic_with_error, Address, Env};
+use soroban_sdk::{panic_with_error, Address, Env, String};
 
-use crate::events::{SeverityAlertEvent, SeverityThresholdsSetEvent};
+use crate::events::{LagAlertEvent, SeverityAlertEvent, SeverityThresholdsSetEvent};
 use crate::storage::{get_admin, LEDGER_BUMP, LEDGER_THRESHOLD};
 use crate::types::{AlertChannel, AlertSeverity, DataKey, ErrorCode, SeverityThresholds};
 
@@ -305,6 +305,7 @@ pub fn get_price_quality_status(env: &Env, asset: Address) -> PriceQualityStatus
     if price.corrected {
         return PriceQualityStatus::Corrected;
     }
+}
 
     let now = env.ledger().timestamp();
     if now > price.timestamp.saturating_add(price.max_age) {
@@ -317,4 +318,6 @@ pub fn get_price_quality_status(env: &Env, asset: Address) -> PriceQualityStatus
         | Some(AlertSeverity::Emergency) => PriceQualityStatus::Degraded,
         _ => PriceQualityStatus::Fresh,
     }
+
+    (source_severity, consumer_severity)
 }
