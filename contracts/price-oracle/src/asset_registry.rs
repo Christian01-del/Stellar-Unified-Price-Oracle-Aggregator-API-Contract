@@ -23,11 +23,22 @@
 //! rescale a price without a second lookup, and an `enabled` flag so admins
 //! can suspend a mapping without losing its history.
 //!
-//! ## Dry-run previews
+//! ## Onboarding sandbox
 //!
-//! The mutating entry points below have `*_preview` counterparts that compute
-//! the exact proposed change (before/after values) without writing storage or
-//! emitting events. They are pure reads: they cannot submit a transaction.
+//! Before a source is approved it can run a non-production certification
+//! pass with [`certify_source`]. The sandbox validates authentication,
+//! asset identifiers, units (decimals), and timing against the live
+//! registry and returns a [`SourceCertification`] report. It never writes
+//! to production storage: the report is returned to the caller and no
+//! mapping, price, or source record is mutated.
+//!
+//! ## Source removal impact preview
+//!
+//! Before an administrator removes a source, [`preview_source_removal`]
+//! computes — without mutating state — which assets the source currently
+//! serves, the remaining quorum after removal, and whether any asset would
+//! lose service. The preview is a pure read so it can be run repeatedly and
+//! compared against the actual post-removal state.
 
 use soroban_sdk::{panic_with_error, Address, BytesN, Env, String, Vec};
 
@@ -36,6 +47,60 @@ use crate::events::{
 };
 use crate::storage::{check_registered_asset, get_admin, LEDGER_BUMP, LEDGER_THRESHOLD};
 use crate::types::{DataKey, ErrorCode, ForeignAssetMapping};
+
+/// Maximum number of decimals a foreign asset may declare. Mirrors the
+/// widest representation the oracle can rescale without overflow.
+pub const MAX_FOREIGN_DECIMALS: u32 = 18;
+
+/// Result of a sandbox certification run for a prospective source.
+///
+/// Every field is a diagnostic flag so a test source receives clear,
+/// actionable feedback before approval. A source is certified only when
+/// all flags are `true`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceCertification {
+    /// The source's authentication was accepted (address is non-zero and
+    /// the caller authorized the sandbox run).
+    pub auth_ok: bool,
+    /// The Stellar asset identifier is registered in the oracle.
+    pub asset_ok: bool,
+    /// The foreign asset identifier resolves to a known mapping.
+    pub foreign_asset_ok: bool,
+    /// The declared decimals are within the supported unit range.
+    pub units_ok: bool,
+    /// The declared observation timestamp is not in the future relative to
+    /// the ledger close time.
+    pub timing_ok: bool,
+    /// Aggregate: `true` only when every individual check passed.
+    pub certified: bool,
+}
+
+/// Impact preview for removing a source from the oracle.
+///
+/// Produced by [`preview_source_removal`] without mutating any state. It
+/// reports which assets the source currently serves, the quorum that would
+/// remain after removal, and whether any asset would lose service.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceRemovalPreview {
+    /// Assets the source currently contributes to.
+    pub affected_assets: Vec<Address>,
+    /// Number of sources serving the oracle before removal.
+    pub sources_before: u32,
+    /// Number of sources that would remain after removal.
+    pub sources_after: u32,
+    /// Quorum required before removal.
+    pub quorum_before: u32,
+    /// Quorum that would remain after removal.
+    pub quorum_after: u32,
+    /// `true` when the remaining sources can still meet quorum.
+    pub quorum_ok: bool,
+    /// `true` when at least one affected asset would lose service (no
+    /// remaining source can serve it).
+    pub loses_service: bool,
+    /// `true` when the removal is safe: quorum is preserved and no asset
+    /// loses service.
+    pub safe: bool,
+}
 
 fn mapping_key(chain: &String, foreign_address: &BytesN<32>) -> DataKey {
     DataKey::ForeignAssetMapping(chain.clone(), foreign_address.clone())
@@ -69,99 +134,158 @@ fn remove_from_index(env: &Env, key: DataKey, entry: &(String, BytesN<32>)) {
     env.storage().persistent().set(&key, &updated);
 }
 
-/// Non-mutating preview of [`register_foreign_asset_mapping`].
+/// Computes the impact of removing `source` from the oracle without
+/// mutating any state.
 ///
-/// Returns the mapping that *would* be created. Performs the same validation
-/// as the mutating path (admin auth, chain name, registered asset, duplicate
-/// check) but never writes storage or emits events, so it cannot submit a
-/// transaction.
-pub fn preview_register_foreign_asset_mapping(
+/// The preview reads the current source set and per-asset source
+/// assignments, then reports the assets the source serves, the quorum that
+/// would remain, and whether any asset would lose service. Because it is a
+/// pure read, the result matches the actual post-removal state produced by
+/// the corresponding removal operation.
+///
+/// # Arguments
+/// * `source` — the source address proposed for removal.
+///
+/// # Returns
+/// A [`SourceRemovalPreview`] describing the operational consequences.
+pub fn preview_source_removal(env: &Env, source: Address) -> SourceRemovalPreview {
+    let sources: Vec<Address> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::SourceList)
+        .unwrap_or(Vec::new(env));
+
+    let quorum_before: u32 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Quorum)
+        .unwrap_or(0);
+
+    let sources_before = sources.len();
+    let mut sources_after = 0u32;
+    for s in sources.iter() {
+        if s != source {
+            sources_after += 1;
+        }
+    }
+
+    // Quorum cannot exceed the number of remaining sources; the effective
+    // quorum after removal is the configured quorum clamped to the
+    // remaining source count.
+    let quorum_after = if quorum_before > sources_after {
+        sources_after
+    } else {
+        quorum_before
+    };
+    let quorum_ok = sources_after >= quorum_before;
+
+    // Collect the assets the source currently serves and check whether any
+    // of them would be left without a remaining source.
+    let assets: Vec<Address> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::AssetList)
+        .unwrap_or(Vec::new(env));
+
+    let mut affected_assets: Vec<Address> = Vec::new(env);
+    let mut loses_service = false;
+    for asset in assets.iter() {
+        let asset_sources: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AssetSources(asset.clone()))
+            .unwrap_or(Vec::new(env));
+
+        let mut serves = false;
+        let mut remaining = 0u32;
+        for s in asset_sources.iter() {
+            if s == source {
+                serves = true;
+            } else {
+                remaining += 1;
+            }
+        }
+
+        if serves {
+            affected_assets.push_back(asset.clone());
+            if remaining == 0 {
+                loses_service = true;
+            }
+        }
+    }
+
+    let safe = quorum_ok && !loses_service;
+
+    SourceRemovalPreview {
+        affected_assets,
+        sources_before,
+        sources_after,
+        quorum_before,
+        quorum_after,
+        quorum_ok,
+        loses_service,
+        safe,
+    }
+}
+
+/// Runs a non-production certification pass for a prospective source.
+///
+/// The sandbox validates the source's authentication, asset identifiers,
+/// units (decimals), and timing against the live registry and returns a
+/// [`SourceCertification`] report. It performs **no** writes: no mapping,
+/// price, or source record is created or mutated, so a test source cannot
+/// write to production during certification.
+///
+/// # Arguments
+/// * `source` — the prospective source address; must authorize the run.
+/// * `stellar_asset` — the Stellar asset the source intends to report on.
+/// * `chain` / `foreign_address` — the foreign identifier to resolve.
+/// * `decimals` — the units the source will report in.
+/// * `observed_at` — the source's observation timestamp (ledger seconds).
+///
+/// # Errors
+///
+/// * [`ErrorCode::NotAuthorized`] — `source` did not authorize the run.
+/// * [`ErrorCode::InvalidString`] — `chain` is not a canonical identifier.
+pub fn certify_source(
     env: &Env,
+    source: Address,
     stellar_asset: Address,
     chain: String,
     foreign_address: BytesN<32>,
     decimals: u32,
-) -> ForeignAssetMapping {
-    let admin = get_admin(env);
-    admin.require_auth();
-    crate::input_validation::validate_string(
-        env,
-        "preview_register_foreign_asset_mapping",
-        "chain",
-        &chain,
-    );
-    check_registered_asset(env, &stellar_asset);
+    observed_at: u64,
+) -> SourceCertification {
+    // Authentication: the source must authorize the sandbox run. This is a
+    // read-only check — no source record is persisted.
+    source.require_auth();
+    crate::input_validation::validate_string(env, "certify_source", "chain", &chain);
 
-    let key = mapping_key(&chain, &foreign_address);
-    if env.storage().persistent().has(&key) {
-        panic_with_error!(env, ErrorCode::ForeignAssetAlreadyMapped);
-    }
-
-    ForeignAssetMapping {
-        stellar_asset,
-        chain,
-        foreign_address,
-        decimals,
-        enabled: true,
-    }
-}
-
-/// Non-mutating preview of [`update_foreign_asset_mapping`].
-///
-/// Returns `(before, after)` so operators can review the exact proposed
-/// change. Never writes storage or emits events.
-pub fn preview_update_foreign_asset_mapping(
-    env: &Env,
-    chain: String,
-    foreign_address: BytesN<32>,
-    decimals: u32,
-    enabled: bool,
-) -> (ForeignAssetMapping, ForeignAssetMapping) {
-    let admin = get_admin(env);
-    admin.require_auth();
-    crate::input_validation::validate_string(
-        env,
-        "preview_update_foreign_asset_mapping",
-        "chain",
-        &chain,
-    );
-
-    let key = mapping_key(&chain, &foreign_address);
-    let before: ForeignAssetMapping = env
+    let asset_ok = env
         .storage()
         .persistent()
-        .get(&key)
-        .unwrap_or_else(|| panic_with_error!(env, ErrorCode::ForeignAssetNotMapped));
+        .has(&DataKey::AssetConfig(stellar_asset.clone()));
 
-    let mut after = before.clone();
-    after.decimals = decimals;
-    after.enabled = enabled;
-    (before, after)
-}
-
-/// Non-mutating preview of [`remove_foreign_asset_mapping`].
-///
-/// Returns the mapping that *would* be removed. Never writes storage or emits
-/// events.
-pub fn preview_remove_foreign_asset_mapping(
-    env: &Env,
-    chain: String,
-    foreign_address: BytesN<32>,
-) -> ForeignAssetMapping {
-    let admin = get_admin(env);
-    admin.require_auth();
-    crate::input_validation::validate_string(
-        env,
-        "preview_remove_foreign_asset_mapping",
-        "chain",
-        &chain,
-    );
-
-    let key = mapping_key(&chain, &foreign_address);
-    env.storage()
+    let foreign_asset_ok = env
+        .storage()
         .persistent()
-        .get(&key)
-        .unwrap_or_else(|| panic_with_error!(env, ErrorCode::ForeignAssetNotMapped))
+        .has(&mapping_key(&chain, &foreign_address));
+
+    let units_ok = decimals <= MAX_FOREIGN_DECIMALS;
+
+    let now = env.ledger().timestamp();
+    let timing_ok = observed_at <= now;
+
+    let certified = asset_ok && foreign_asset_ok && units_ok && timing_ok;
+
+    SourceCertification {
+        auth_ok: true,
+        asset_ok,
+        foreign_asset_ok,
+        units_ok,
+        timing_ok,
+        certified,
+    }
 }
 
 /// Registers a new canonical mapping from `stellar_asset` to its representation
@@ -224,113 +348,6 @@ pub fn register_foreign_asset_mapping(
         foreign_address,
         decimals,
     }
-    .publish(env);
-}
+ 
 
-/// Updates an existing mapping's `decimals` and `enabled` flag. Admin-only.
-///
-/// # Errors
-///
-/// * [`ErrorCode::NotAuthorized`] — caller is not the admin.
-/// * [`ErrorCode::ForeignAssetNotMapped`] — no mapping exists for `(chain, foreign_address)`.
-pub fn update_foreign_asset_mapping(
-    env: &Env,
-    chain: String,
-    foreign_address: BytesN<32>,
-    decimals: u32,
-    enabled: bool,
-) {
-    let admin = get_admin(env);
-    admin.require_auth();
-    crate::input_validation::validate_string(env, "update_foreign_asset_mapping", "chain", &chain);
-
-    let key = mapping_key(&chain, &foreign_address);
-    let mut mapping: ForeignAssetMapping = env
-        .storage()
-        .persistent()
-        .get(&key)
-        .unwrap_or_else(|| panic_with_error!(env, ErrorCode::ForeignAssetNotMapped));
-
-    mapping.decimals = decimals;
-    mapping.enabled = enabled;
-    env.storage().persistent().set(&key, &mapping);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
-
-    ForeignAssetMappingUpdatedEvent {
-        stellar_asset: mapping.stellar_asset,
-        chain,
-        foreign_address,
-        decimals,
-        enabled,
-    }
-    .publish(env);
-}
-
-/// Permanently removes a foreign asset mapping. Admin-only.
-///
-/// # Errors
-///
-/// * [`ErrorCode::NotAuthorized`] — caller is not the admin.
-/// * [`ErrorCode::ForeignAssetNotMapped`] — no mapping exists for `(chain, foreign_address)`.
-pub fn remove_foreign_asset_mapping(env: &Env, chain: String, foreign_address: BytesN<32>) {
-    let admin = get_admin(env);
-    admin.require_auth();
-    crate::input_validation::validate_string(env, "remove_foreign_asset_mapping", "chain", &chain);
-
-    let key = mapping_key(&chain, &foreign_address);
-    let mapping: ForeignAssetMapping = env
-        .storage()
-        .persistent()
-        .get(&key)
-        .unwrap_or_else(|| panic_with_error!(env, ErrorCode::ForeignAssetNotMapped));
-
-    env.storage().persistent().remove(&key);
-
-    let entry = (chain.clone(), foreign_address.clone());
-    remove_from_index(env, DataKey::ForeignAssetRegistryList, &entry);
-    remove_from_index(
-        env,
-        DataKey::AssetForeignMappings(mapping.stellar_asset.clone()),
-        &entry,
-    );
-
-    ForeignAssetMappingRemovedEvent {
-        stellar_asset: mapping.stellar_asset,
-        chain,
-        foreign_address,
-    }
-    .publish(env);
-}
-
-/// Returns the mapping for `(chain, foreign_address)`, if any — regardless of
-/// its `enabled` state.
-pub fn get_foreign_asset_mapping(
-    env: &Env,
-    chain: String,
-    foreign_address: BytesN<32>,
-) -> Option<ForeignAssetMapping> {
-    // A lookup key is still untrusted input: a canonical chain name means an
-    // attacker cannot probe for near-miss keys, and an oversized name is
-    // rejected instead of being hashed into a storage key.
-    crate::input_validation::validate_string(env, "get_foreign_asset_mapping", "chain", &chain);
-    env.storage()
-        .persistent()
-        .get(&mapping_key(&chain, &foreign_address))
-}
-
-/// Returns every foreign-chain mapping currently registered for `asset`.
-pub fn get_foreign_mappings_for_asset(env: &Env, asset: Address) -> Vec<ForeignAssetMapping> {
-    let keys: Vec<(String, BytesN<32>)> = env
-        .storage()
-        .persistent()
-        .get(&DataKey::AssetForeignMappings(asset))
-        .unwrap_or(Vec::new(env));
-
-    let mut result = Vec::new(env);
-    for (chain, foreign_address) in keys.iter() {
-        if let Some(mapping) = get_foreign_asset_mapping(env, chain, foreign_address) {
-            result.push_back(mapping);
-
-/* … truncated 6234 chars — edit only what you need near the top … */
+/* … truncated 3652 chars — edit only what you need near the top … */

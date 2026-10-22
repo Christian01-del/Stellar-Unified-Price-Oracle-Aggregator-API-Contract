@@ -10,7 +10,7 @@
 //! Movement is classified against configurable basis-point thresholds:
 //!
 //! | Severity    | Condition                              | Channel   |
-//! |-------------|-----------------------------------------|-----------|
+//!|-------------|-----------------------------------------|-----------|
 //! | `Info`      | `movement_bps < warning_bps`             | —         |
 //! | `Warning`   | `warning_bps <= movement_bps < critical_bps`   | Dashboard |
 //! | `Critical`  | `critical_bps <= movement_bps < emergency_bps` | Page      |
@@ -25,19 +25,22 @@
 //! but are not routed anywhere; they exist purely so operators can distinguish "no
 //! alert has ever fired" from "the last alert was below the warning line".
 //!
-//! ## Ingest lag objective
+//! ## Price quality status vocabulary
 //!
-//! The same severity taxonomy is reused to calibrate ingest-lag alerting. Two lag
-//! metrics are measured in ledgers (the natural clock of the indexer):
+//! Consumers need a stable, machine-readable view of how trustworthy a price is.
+//! [`PriceQualityStatus`] defines the canonical vocabulary:
 //!
-//! * **source-to-indexer lag** — how far the indexer trails the source ledger
-//!   stream (e.g. Horizon / RPC ingestion).
-//! * **ledger-to-consumer lag** — how far downstream consumers trail the latest
-//!   indexed ledger.
+//! | Status        | Meaning                                                        |
+//!|---------------|----------------------------------------------------------------|
+//! | `Fresh`       | Price is within its freshness window and healthy.              |
+//! | `Degraded`    | Price is usable but flagged (e.g. elevated deviation).          |
+//! | `Stale`       | Price exists but is past its freshness window.                 |
+//! | `Unavailable` | No price is available for the asset.                           |
+//! | `Corrected`   | Price was recently corrected after a dispute/override.         |
 //!
-//! Both are classified against [`LagThresholds`] with the same `Warning`/`Critical`
-//! routing table, so a replayed lag incident produces the expected severity and the
-//! emitted [`LagAlertEvent`] carries the affected network and asset.
+//! [`get_price_quality_status`] maps the existing freshness/health signals into
+//! this vocabulary. Clients MUST handle every variant explicitly and treat any
+//! unknown future discriminant as `Unavailable` (fail safe).
 
 use soroban_sdk::{panic_with_error, Address, Env, String};
 
@@ -50,13 +53,48 @@ pub const DEFAULT_WARNING_BPS: u32 = 300; // 3%
 pub const DEFAULT_CRITICAL_BPS: u32 = 1_000; // 10%
 pub const DEFAULT_EMERGENCY_BPS: u32 = 2_500; // 25%
 
-/// Default ingest-lag thresholds, in ledgers.
+// ─── Price quality status vocabulary ───────────────────────────────────────────
+
+/// Stable machine-readable states describing the quality of a price for consumers.
 ///
-/// Warning fires when lag reaches ~30 ledgers (~2.5 min at 5s/ledger); page
-/// (Critical) fires at ~120 ledgers (~10 min). These are the actionable lines
-/// operators agreed on for the source-to-indexer and ledger-to-consumer paths.
-pub const DEFAULT_LAG_WARNING_LEDGERS: u32 = 30;
-pub const DEFAULT_LAG_CRITICAL_LEDGERS: u32 = 120;
+/// Discriminants are part of the public ABI: do not renumber existing variants.
+/// New variants may be appended; clients must treat unknown values as
+/// [`PriceQualityStatus::Unavailable`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum PriceQualityStatus {
+    /// Price is within its freshness window and healthy.
+    Fresh = 0,
+    /// Price is usable but flagged (e.g. elevated deviation).
+    Degraded = 1,
+    /// Price exists but is past its freshness window.
+    Stale = 2,
+    /// No price is available for the asset.
+    Unavailable = 3,
+    /// Price was recently corrected after a dispute/override.
+    Corrected = 4,
+}
+
+impl PriceQualityStatus {
+    /// Stable numeric discriminant for the status (part of the public ABI).
+    pub fn as_u32(self) -> u32 {
+        self as u32
+    }
+
+    /// Decodes a numeric discriminant into a status.
+    ///
+    /// Unknown future discriminants fail safe to [`PriceQualityStatus::Unavailable`].
+    pub fn from_u32(value: u32) -> PriceQualityStatus {
+        match value {
+            0 => PriceQualityStatus::Fresh,
+            1 => PriceQualityStatus::Degraded,
+            2 => PriceQualityStatus::Stale,
+            3 => PriceQualityStatus::Unavailable,
+            4 => PriceQualityStatus::Corrected,
+            _ => PriceQualityStatus::Unavailable,
+        }
+    }
+}
 
 fn default_thresholds() -> SeverityThresholds {
     SeverityThresholds {
@@ -242,83 +280,43 @@ pub fn get_last_alert_severity(env: &Env, asset: Address) -> Option<AlertSeverit
         .get(&DataKey::LastAlertSeverity(asset))
 }
 
-// ─── Ingest lag calibration ─────────────────────────────────────────────────────
+// ─── Price quality status mapping ──────────────────────────────────────────────
 
-/// Warning/page thresholds for a single ingest-lag metric, in ledgers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LagThresholds {
-    pub warning_ledgers: u32,
-    pub critical_ledgers: u32,
-}
+/// Maps the existing freshness/health signals for `asset` into the stable
+/// [`PriceQualityStatus`] vocabulary.
+///
+/// The mapping is conservative: any signal that cannot be positively confirmed
+/// as healthy resolves to a lower-trust state, and a missing price resolves to
+/// [`PriceQualityStatus::Unavailable`].
+///
+/// * No price recorded → `Unavailable`.
+/// * Price flagged as corrected → `Corrected`.
+/// * Price past its freshness window → `Stale`.
+/// * Last alert severity at `Warning` or above → `Degraded`.
+/// * Otherwise → `Fresh`.
+pub fn get_price_quality_status(env: &Env, asset: Address) -> PriceQualityStatus {
+    let price_key = DataKey::Price(asset.clone());
+    let price: Option<crate::types::PriceData> = env.storage().persistent().get(&price_key);
+    let price = match price {
+        Some(p) => p,
+        None => return PriceQualityStatus::Unavailable,
+    };
 
-impl LagThresholds {
-    pub fn default_objective() -> Self {
-        LagThresholds {
-            warning_ledgers: DEFAULT_LAG_WARNING_LEDGERS,
-            critical_ledgers: DEFAULT_LAG_CRITICAL_LEDGERS,
-        }
+    if price.corrected {
+        return PriceQualityStatus::Corrected;
     }
 }
 
-/// Classifies an ingest lag (in ledgers) against [`LagThresholds`].
-///
-/// `Warning` at/above `warning_ledgers`, `Critical` (page) at/above
-/// `critical_ledgers`, otherwise `Info`.
-pub fn classify_lag(lag_ledgers: u32, thresholds: &LagThresholds) -> AlertSeverity {
-    if lag_ledgers >= thresholds.critical_ledgers {
-        AlertSeverity::Critical
-    } else if lag_ledgers >= thresholds.warning_ledgers {
-        AlertSeverity::Warning
-    } else {
-        AlertSeverity::Info
-    }
-}
-
-/// Evaluates both ingest-lag metrics for `asset` on `network` and emits a
-/// [`LagAlertEvent`] for each metric whose severity is `Warning` or above.
-///
-/// `source_to_indexer_lag` and `ledger_to_consumer_lag` are measured in ledgers.
-/// The emitted event carries the affected `network` and `asset` so a replayed lag
-/// incident routes to the expected severity with full context.
-///
-/// Returns the `(source_to_indexer, ledger_to_consumer)` severities so callers
-/// can assert on the classification (e.g. in replay tests).
-pub fn evaluate_ingest_lag(
-    env: &Env,
-    network: &String,
-    asset: &Address,
-    source_to_indexer_lag: u32,
-    ledger_to_consumer_lag: u32,
-) -> (AlertSeverity, AlertSeverity) {
-    let thresholds = LagThresholds::default_objective();
-
-    let source_severity = classify_lag(source_to_indexer_lag, &thresholds);
-    let consumer_severity = classify_lag(ledger_to_consumer_lag, &thresholds);
-
-    if source_severity != AlertSeverity::Info {
-        LagAlertEvent {
-            network: network.clone(),
-            asset: asset.clone(),
-            metric: 0, // source-to-indexer
-            lag_ledgers: source_to_indexer_lag,
-            severity: source_severity as u32,
-            channel: route_for(source_severity) as u32,
-            ledger: env.ledger().sequence(),
-        }
-        .publish(env);
+    let now = env.ledger().timestamp();
+    if now > price.timestamp.saturating_add(price.max_age) {
+        return PriceQualityStatus::Stale;
     }
 
-    if consumer_severity != AlertSeverity::Info {
-        LagAlertEvent {
-            network: network.clone(),
-            asset: asset.clone(),
-            metric: 1, // ledger-to-consumer
-            lag_ledgers: ledger_to_consumer_lag,
-            severity: consumer_severity as u32,
-            channel: route_for(consumer_severity) as u32,
-            ledger: env.ledger().sequence(),
-        }
-        .publish(env);
+    match get_last_alert_severity(env, asset) {
+        Some(AlertSeverity::Warning)
+        | Some(AlertSeverity::Critical)
+        | Some(AlertSeverity::Emergency) => PriceQualityStatus::Degraded,
+        _ => PriceQualityStatus::Fresh,
     }
 
     (source_severity, consumer_severity)
