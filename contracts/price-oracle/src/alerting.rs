@@ -13,6 +13,39 @@ use crate::events::PriceDeviationAlertEvent;
 use crate::storage::LEDGER_BUMP;
 use crate::types::DataKey;
 
+/// Maximum number of alert records retained in the incident evidence bundle.
+const MAX_INCIDENT_ALERTS: u32 = 32;
+
+/// A single redacted alert record captured for incident reproduction.
+#[derive(Clone)]
+pub struct IncidentAlertRecord {
+    /// Asset the alert was raised for.
+    pub asset: Address,
+    /// Our aggregated price at alert time.
+    pub our_price: i128,
+    /// External reference price at alert time.
+    pub reference_price: i128,
+    /// Deviation in basis points that triggered the alert.
+    pub deviation_bps: u32,
+    /// Ledger sequence at which the alert was recorded.
+    pub ledger: u32,
+}
+
+/// Redacted incident evidence bundle for a source incident.
+///
+/// Contains only the data required to reproduce a source incident: the alert
+/// history, timestamps (ledger sequences), and the source version. Credentials
+/// and unrelated user data are never included.
+#[derive(Clone)]
+pub struct IncidentEvidenceBundle {
+    /// Source version string (e.g. contract build identifier).
+    pub source_version: String,
+    /// Ledger sequence at which the bundle was assembled.
+    pub captured_at_ledger: u32,
+    /// Redacted alert history, most recent last.
+    pub alerts: Vec<IncidentAlertRecord>,
+}
+
 /// Checks price deviation against a reference and triggers alert if threshold exceeded.
 ///
 /// # Arguments
@@ -73,6 +106,15 @@ fn record_deviation_alert(
         .persistent()
         .extend_ttl(&key, 300000, LEDGER_BUMP);
 
+    // Append to the bounded alert history used by the incident evidence bundle.
+    append_alert_history(
+        env,
+        asset,
+        our_price,
+        reference_price,
+        deviation_bps,
+    );
+
     PriceDeviationAlertEvent {
         asset: asset.clone(),
         our_price,
@@ -81,6 +123,80 @@ fn record_deviation_alert(
         ledger: env.ledger().sequence(),
     }
     .publish(env);
+}
+
+/// Appends an alert to the bounded per-asset alert history.
+///
+/// Keeps at most `MAX_INCIDENT_ALERTS` records, dropping the oldest when full.
+fn append_alert_history(
+    env: &Env,
+    asset: &Address,
+    our_price: i128,
+    reference_price: i128,
+    deviation_bps: u32,
+) {
+    let key = DataKey::AlertHistory(asset.clone());
+    let mut history: Vec<IncidentAlertRecord> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| Vec::new(env));
+
+    if history.len() >= MAX_INCIDENT_ALERTS {
+        let mut trimmed = Vec::new(env);
+        let start = history.len() - (MAX_INCIDENT_ALERTS - 1);
+        for i in start..history.len() {
+            if let Some(record) = history.get(i) {
+                trimmed.push_back(record);
+            }
+        }
+        history = trimmed;
+    }
+
+    history.push_back(IncidentAlertRecord {
+        asset: asset.clone(),
+        our_price,
+        reference_price,
+        deviation_bps,
+        ledger: env.ledger().sequence(),
+    });
+
+    env.storage().persistent().set(&key, &history);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, 300000, LEDGER_BUMP);
+}
+
+/// Builds a redacted incident evidence bundle for an asset.
+///
+/// The bundle contains the alert history, timestamps (ledger sequences), and
+/// the supplied source version. It intentionally excludes credentials and any
+/// unrelated user data so it can be shared to reproduce a source incident.
+///
+/// # Arguments
+/// * `env` - Execution environment.
+/// * `asset` - Asset whose incident evidence is being collected.
+/// * `source_version` - Source version string to stamp on the bundle.
+///
+/// # Returns
+/// A redacted `IncidentEvidenceBundle` for the asset.
+pub fn build_incident_evidence_bundle(
+    env: &Env,
+    asset: &Address,
+    source_version: String,
+) -> IncidentEvidenceBundle {
+    let key = DataKey::AlertHistory(asset.clone());
+    let alerts: Vec<IncidentAlertRecord> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| Vec::new(env));
+
+    IncidentEvidenceBundle {
+        source_version,
+        captured_at_ledger: env.ledger().sequence(),
+        alerts,
+    }
 }
 
 /// Registers an external reference oracle for price comparison.
