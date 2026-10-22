@@ -22,6 +22,7 @@
 #   secret-scan        - secret scan of the tree, with a history report (#502)
 #   check-pins         - every dependency pinned exactly, lockfile in sync (#501)
 #   reproducible-build - two clean builds must produce identical WASM (#501)
+#   dr-drill           - disaster recovery restoration evidence drill (#620)
 
 # Determinism & Interleaving Suite (#516)
 #
@@ -31,7 +32,7 @@
 .PHONY: all build test lint fmt check clean watch gas-gate load-test \
         mutation-gate mutation-per-module hermetic sast secret-scan \
         check-pins reproducible-build security rpc-gate indexer-trust \
-        tx-review-gate redaction-gate trust-boundary
+        tx-review-gate redaction-gate trust-boundary dr-drill
 
 all: build test
 
@@ -107,6 +108,13 @@ redaction-gate:
 trust-boundary: rpc-gate indexer-trust tx-review-gate redaction-gate
 	python3 -m pytest services/rpc_guard services/indexer services/tx_review \
 		services/evidence_redaction -q
+
+# #620: disaster recovery restoration evidence drill. Restores a
+# production-shaped off-chain state backup into an isolated environment and
+# records completeness checks (checksums, schema version, reconciled ledger
+# height) before declaring the restore successful.
+dr-drill:
+	python3 -m services.dr_drill.gate --report dr-artifacts/restore-drill.md
 
 # Run clippy linter
 lint:
