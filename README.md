@@ -70,7 +70,8 @@ A **decentralized price oracle aggregator** built on Soroban (Stellar smart cont
 | Function | Description |
 |----------|-------------|
 | `get_historical_price(asset, ledger) -> PriceHistoryEntry` | Get historical price at a specific ledger (interpolated if enabled) |
-| `get_historical_prices(asset, start, end) -> Vec<PriceHistoryEntry>` | Get historical prices in a ledger range |
+| `get_historical_prices(asset, start, end) -> Vec<PriceHistoryEntry>` | Get historical prices in an inclusive range of up to 50 ledger numbers |
+| `get_historical_prices_paginated(asset, cursor, limit)` | Get up to 50 entries in ascending ledger order; pass `next_cursor` to continue |
 | `has_historical_price(asset, ledger) -> bool` | Check if historical price exists |
 | `set_interpolation_enabled(bool)` | Enable/disable linear interpolation for history gaps (admin) |
 | `get_interpolation_enabled() -> bool` | Check if interpolation is enabled |
@@ -80,11 +81,12 @@ A **decentralized price oracle aggregator** built on Soroban (Stellar smart cont
 | Function | Description |
 |----------|-------------|
 | `base() → Asset` | Returns the base asset (USD) |
-| `assets() → Vec<Asset>` | Returns all registered assets as `Asset::Stellar` |
+| `assets() → Vec<Asset>` | Returns all registered assets as `Asset::Stellar` (maximum 100; use pagination for larger registries) |
+| `assets_paginated(cursor, limit)` | Get up to 50 assets in registration order; pass `next_cursor` to continue |
 | `decimals() → u32` | Returns price decimals |
 | `resolution() → u32` | Returns staleness window in seconds (0 = no expiry) |
 | `price(asset, timestamp) → Option<PriceData>` | Get price at or before a given timestamp |
-| `prices(asset, records) → Option<Vec<PriceData>>` | Get latest N historical price records |
+| `prices(asset, records) → Option<Vec<PriceData>>` | Get up to 50 latest historical price records |
 | `lastprice(asset) → Option<PriceData>` | Get latest aggregated price |
 
 ### Contract Events
@@ -197,6 +199,23 @@ export ORACLE_NETWORK=testnet        # default: testnet
 ./scripts/oracle-cli.sh health-check
 ```
 
+### Query response limits and cursors
+
+Historical range queries include at most 50 ledger numbers, and the SEP-40
+`prices` query returns at most 50 records. For longer history reads, call
+`get_historical_prices_paginated(asset, cursor, limit)` with `cursor = 0` on
+the first request and pass each returned `next_cursor` unchanged; it identifies
+the first ledger to include on the next page. Results are in ascending ledger
+order and gaps are skipped.
+
+The full `assets()` and `list_assets()` responses are capped at 100 assets.
+Use `assets_paginated(cursor, limit)` for larger registries: start with
+`cursor = None`, then pass the last returned asset as the next cursor. This
+preserves registration order without repeats. If that cursor asset has been
+unregistered, the contract returns `InvalidPageCursor`; restart from the first
+page to avoid silently omitting assets. Page limits for both paginated query
+families are 1–50.
+
 ## Getting Started
 
 ### Prerequisites
@@ -264,3 +283,83 @@ contracts/price-oracle/
 | Layer | Technology |
 |-------|-----------|
 | Contract | Rust, Soroban SDK v26 |
+| Target | `wasm32v1-none` (WebAssembly) |
+| Aggregation | On-chain median (Rust) |
+| Testing | `#[cfg(test)]` with `soroban-sdk/testutils` |
+
+## Error Codes
+
+| Code | Name | Description |
+|------|------|-------------|
+| 0 | `NotAuthorized` | Caller is not the admin or required signer |
+| 1 | `AlreadyInitialized` | Contract already initialized |
+| 2 | `AssetNotRegistered` | Asset not found |
+| 3 | `AssetAlreadyRegistered` | Asset already registered |
+| 4 | `SourceAlreadyExists` | Source already registered |
+| 5 | `SourceNotFound` | Source not found |
+| 6 | `InsufficientSources` | Not enough sources for aggregation |
+| 7 | `InvalidPrice` | Price is zero or negative |
+| 8 | `NoData` | No price data available (or gap with interpolation disabled) |
+| 9 | `InvalidTimestamp` | Submitted timestamp too far in the future |
+| 10 | `InvalidConfiguration` | Configuration parameter out of valid range |
+| 11 | `DescriptionTooLong` | Description exceeds 256 characters |
+| 12 | `ContractPaused` | Contract is paused; operations blocked |
+| 13 | `TimelockNotReady` | Timelock delay has not elapsed |
+| 14 | `OperationNotFound` | No pending timelock operation with that ID |
+| 15 | `PriceBelowMinimum` | Price is below the asset's configured minimum |
+
+See [`docs/error-codes.md`](docs/error-codes.md) for the full registry with causes and resolutions.
+
+## Documentation
+
+| Document | Description |
+|---|---|
+| [Architecture](docs/ARCHITECTURE.md) | System design, data flow, module structure |
+| [Hackathon Bounty Track](docs/hackathon-bounty-track.md) | Hackathon bounty track definition, curated project ideas, judging rubric, and reward tiers |
+| [Deployment Record](docs/deployment.md) | Contract addresses, initialization parameters, admin addresses, deployment checklist |
+| [Security Audit Checklist](docs/security-audit-checklist.md) | Pre-audit review items: access control, input validation, arithmetic safety, storage safety, upgrade mechanism, event integrity, known patterns |
+| [Attack-Regression Corpus](docs/security/attack-regression-corpus.md) | Every historical adversarial scenario pinned as a test, by attack class, with a mutation check proving the corpus has teeth (#511) |
+| [Formal Verification](docs/security/formal-verification.md) | Bounded proofs for the aggregation math, the stated bounded domain, and the proven-vs-sampled split (#512) |
+| [State-Machine Model](docs/security/state-machine-model.md) | Independently written model of the aggregate lifecycle, driven by shrinking random traces (#513) |
+| [Coverage-Guided Fuzzing](docs/security/fuzzing.md) | Fuzz targets, the committed minimized corpus, and the CI crash and size gates (#514) |
+| [Monitoring Dashboard](docs/monitoring/README.md) | Grafana dashboard setup and metrics reference |
+| [Quickstart Templates](examples/README.md) | CI-tested web (SEP-40), Python bot and indexer templates |
+| [Interface Package](docs/interface-versioning.md) | Versioned `@stellar-unified-price-oracle/interface` npm package, semver rules, deprecation policy |
+| [Error Registry](docs/errors/REGISTRY.md) | Every error code with meaning, cause and remediation ([JSON](docs/errors/registry.json)) |
+| [Migration Guides](docs/migrations/README.md) | Per-version guides for breaking changes and deprecation windows |
+| [Integration Case Studies](docs/case-studies.md) | Lending, DEX and payments integrations with threat models, worked exploits and countermeasures |
+| [Seam Invariant Catalogue](docs/seam-invariants.md) | Cross-module invariants and the regression tests that enforce them |
+| [SLA](docs/SLA.md) | Service levels and the machine-enforceable clause map checked by `services/sla_monitor` |
+| [Runbook](docs/runbook.md) | Every paging alert mapped to meaning, first check, mitigation, escalation, resolution, owner and review cadence (#527) |
+| [Incident Management](docs/incident-management/README.md) | Blameless postmortem process, template, index and tracked action items (#528) |
+| [Backup and Restore](docs/backup-restore.md) | Off-chain state inventory, encrypted backups, point-in-time restore and reconciliation (#529) |
+| [Capacity Planning](docs/capacity-planning.md) | Ingest, storage and ledger-budget model with headroom targets and load shedding (#530) |
+| [Price Revision Metrics](docs/price-revision-metrics.md) | Correction-rate metric per asset and per source, cause separation, volume normalization and sustained-increase alerting (#499) |
+| [Static Analysis](docs/static-analysis.md) | SAST rules, dependency-advisory gate, owned+expiring allowlist and the re-baseline process (#500) |
+| [Reproducible Builds](docs/reproducible-builds.md) | Exact dependency pins, canonical containerized build environment, two-build digest check (#501) |
+| [Secret Scanning](docs/secret-scanning.md) | Pre-commit and CI secret scanning, history scan, allowlist process and the rotation playbook (#502) |
+
+## Documentation
+
+- [Hackathon Bounty Track](docs/hackathon-bounty-track.md) — reusable hackathon track definition, curated ideas mapped to open issues, judging rubric, and reward tiers (#407)
+- [Price Submission Bot Design](docs/price-submission-bot.md) — off-chain bot architecture for automated price submissions
+- [Signed CEX/Aggregator Adapters](docs/signed-price-adapters.md) — CoinGecko/Binance/Coinbase adapters with failover, staleness handling, and signed submission (#216)
+- [Disaster Recovery Plan](docs/disaster-recovery.md) — failure scenario playbooks and recovery procedures
+- [Architecture](docs/ARCHITECTURE.md) — contract design and data flow
+- [Monitoring](docs/monitoring/README.md) — Grafana dashboard and alerting setup
+
+## License
+
+MIT
+
+## Service Level Agreement
+
+See [docs/SLA.md](docs/SLA.md) for price freshness guarantees, uptime commitments, deviation thresholds, incident response times, and compensation terms.
+
+## Handsoff notes
+
+<!-- handsoff-issue-672 -->
+- #672: [Economics] Fee and reward parameter sensitivity analysis
+
+<!-- handsoff-issue-673 -->
+- #673: [Economics] Economic emergency reserve policy
