@@ -1,9 +1,14 @@
 //! # #454 — Admin key compromise: blast radius and recovery drill
+//! # #658 — Admin succession and unavailable-signer recovery
 //!
 //! Proves a compromised admin key cannot block its own revocation through
 //! the guardian recovery path, and scripts the recovery drill end to end.
 //! The capability list and residual risk are documented in
 //! `docs/security/admin-compromise-drill.md`.
+//!
+//! #658 adds the *unavailable* (not compromised) signer path: when the admin
+//! key is simply lost, guardians must still be able to succeed the admin
+//! through the same documented recovery flow — no privileged shortcut.
 
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
@@ -163,6 +168,69 @@ fn recovery_drill_end_to_end() {
     d.client
         .add_source(&honest, &String::from_str(&e, "Honest"));
     assert!(d.client.is_source(&honest));
+    assert!(d.client.recovery_get_pending().is_none());
+}
+
+// ---------------------------------------------------------------------------
+// #658 — Unavailable-signer (lost key) succession
+// ---------------------------------------------------------------------------
+
+/// Tabletop: the admin key is *lost*, not compromised. Guardians must be able
+/// to succeed the admin through the same documented recovery flow, and the
+/// unavailable signer must not be able to block it (it simply cannot sign).
+#[test]
+fn unavailable_admin_signer_recovers_via_guardians() {
+    let e = Env::default();
+    let d = setup(&e);
+    let start = e.ledger().sequence();
+
+    // The admin key is unavailable: no admin-signed call is possible. The
+    // only path forward is the guardian recovery flow.
+    reach_quorum(&d);
+    assert!(d.client.recovery_get_pending().is_some());
+
+    // Recovery cannot execute before the delay elapses.
+    advance(&e, DELAY - 1);
+    assert!(d.client.try_recovery_execute().is_err());
+
+    // After the delay the successor takes over with no privileged shortcut.
+    advance(&e, 1);
+    d.client.recovery_execute();
+    assert_eq!(d.client.get_admin(), d.rescue);
+    assert_ne!(d.client.get_admin(), d.attacker_admin);
+    assert!(d.client.recovery_get_pending().is_none());
+    assert_eq!(e.ledger().sequence() - start, DELAY);
+
+    // The successor can operate normally (reinstatement of a source).
+    let honest = Address::generate(&e);
+    d.client
+        .add_source(&honest, &String::from_str(&e, "Honest"));
+    assert!(d.client.is_source(&honest));
+}
+
+/// Boundary: a single guardian approval is not enough to succeed an
+/// unavailable admin; quorum is still required.
+#[test]
+fn unavailable_admin_signer_requires_full_quorum() {
+    let e = Env::default();
+    let d = setup(&e);
+    d.client.recovery_approve(&d.g1, &d.rescue);
+    // Only one of two guardians approved: no pending recovery to execute.
+    assert!(d.client.recovery_get_pending().is_none());
+    advance(&e, DELAY);
+    assert!(d.client.try_recovery_execute().is_err());
+    assert_eq!(d.client.get_admin(), d.attacker_admin);
+}
+
+/// Failure path: an unavailable admin cannot be bypassed by a non-guardian
+/// caller — authorization controls are not weakened by the recovery flow.
+#[test]
+fn unavailable_admin_signer_cannot_be_bypassed_by_outsider() {
+    let e = Env::default();
+    let d = setup(&e);
+    let outsider = Address::generate(&e);
+    let r = d.client.try_recovery_approve(&outsider, &d.rescue);
+    assert_eq!(r, Err(Ok(code(ErrorCode::NotAuthorized))));
     assert!(d.client.recovery_get_pending().is_none());
 }
 
