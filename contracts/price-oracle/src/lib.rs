@@ -217,6 +217,12 @@ mod staged_rollout;
 mod corrections;
 // #398: pre-aggregation data-quality pipeline.
 mod dq_pipeline;
+// #712: historical query completeness watermark.
+mod watermark;
+// #713: consumer-visible uncertainty and confidence semantics.
+mod spread_indicator;
+// #714: data retention and correction trace policy.
+mod retention_policy;
 // #400: blackout / quiet-period windows.
 mod blackout;
 // #401: cross-source comparison dashboard data.
@@ -433,6 +439,12 @@ pub use types::{
     SubscriptionPayment, SubscriptionPlan, SubscriptionPlans, TemplateStep, TotalStorageBudget,
     TwapMethod, TwapResult, VersionedAggregatePrice, WeightedAggregate, WormholeGuardianSet,
     WormholePricePayload, WormholeVaa, ZkPriceAttestation,
+    // #712 — Historical query completeness watermark
+    CompletenessWatermark,
+    // #713 — Consumer-visible uncertainty and confidence semantics
+    SpreadIndicator, SpreadInterpretation,
+    // #714 — Data retention and correction trace policy
+    DataRetentionPolicy,
 };
 
 use soroban_sdk::{
@@ -7264,6 +7276,162 @@ impl PriceOracleContract {
     pub fn verify_provenance(env: Env, asset: Address, ledger: u32) -> bool {
         provenance::verify_link(&env, &asset, ledger)
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // #712 — Historical query completeness watermark
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Returns the completeness watermark for an asset's historical price data.
+    ///
+    /// The watermark is the highest ledger sequence number through which
+    /// historical data is **complete and contiguous**. No gaps exist in the
+    /// range `[first_ledger, watermark_ledger]`.
+    ///
+    /// A gap in the recorded history index (from TTL expiry, pruning, or missed
+    /// submissions) prevents the watermark from advancing past the start of
+    /// that gap. Consumers SHOULD NOT query ledgers above `watermark_ledger`
+    /// without explicitly checking whether a snapshot exists.
+    ///
+    /// Returns `None` if no history has ever been recorded for the asset.
+    ///
+    /// See `docs/history-completeness-watermark.md` for full semantics.
+    pub fn get_history_watermark(
+        env: Env,
+        asset: Address,
+    ) -> Option<types::CompletenessWatermark> {
+        crate::storage::check_registered_asset(&env, &asset);
+        watermark::get_watermark(&env, &asset)
+    }
+
+    /// Recomputes and stores the completeness watermark for an asset.
+    ///
+    /// This function is called automatically after every successful price
+    /// aggregation (via `prices.rs`). Operators may call it manually to
+    /// refresh the watermark after a storage migration or TTL extension sweep.
+    ///
+    /// Returns the updated watermark.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorCode::AssetNotRegistered`] — if `asset` is not registered.
+    pub fn refresh_history_watermark(
+        env: Env,
+        asset: Address,
+    ) -> types::CompletenessWatermark {
+        crate::storage::check_registered_asset(&env, &asset);
+        watermark::advance_watermark(&env, &asset)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // #713 — Consumer-visible uncertainty and confidence semantics
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Returns the spread indicator for an asset's current aggregate price.
+    ///
+    /// The spread indicator quantifies the **statistical dispersion** of the
+    /// contributing oracle source prices. A tight spread means sources agree;
+    /// a wide spread means notable divergence.
+    ///
+    /// ## Important: this is NOT a probability
+    ///
+    /// `relative_spread_bps` measures how much sources disagree with each other
+    /// (the IQR relative to the median), not the probability that the published
+    /// price is within any particular tolerance of a true value. Sources can
+    /// agree on an incorrect price; a tight spread is evidence of consensus,
+    /// not correctness.
+    ///
+    /// ## Interpretation
+    ///
+    /// | `spread_interpretation` | Suggested action |
+    /// |---|---|
+    /// | `Tight` (< 50 bps) | Use aggregate directly. |
+    /// | `Normal` (50–200 bps) | Use with standard risk margins. |
+    /// | `Wide` (200–500 bps) | Widen safety margins; consider secondary validation. |
+    /// | `VeryWide` (> 500 bps or `low_confidence`) | Treat as indicative; avoid risk-sensitive ops. |
+    ///
+    /// Returns `None` if no aggregation has been performed for this asset yet.
+    ///
+    /// See `docs/spread-indicator.md` for full semantics and limits.
+    pub fn get_spread_indicator(
+        env: Env,
+        asset: Address,
+    ) -> Option<types::SpreadIndicator> {
+        crate::storage::check_registered_asset(&env, &asset);
+        spread_indicator::get_spread_indicator(&env, &asset)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // #714 — Data retention and correction trace policy
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Returns the current data retention policy.
+    ///
+    /// The policy defines minimum retention windows (in ledgers) for each
+    /// category of oracle data:
+    ///
+    /// - **`history_ledgers`** — price-history snapshots
+    /// - **`audit_ledgers`** — audit log entries (including rejected submissions)
+    /// - **`correction_ledgers`** — price-correction revision chains
+    ///
+    /// If no explicit policy has been set, returns the default policy.
+    ///
+    /// ## Guarantees
+    ///
+    /// - `audit_ledgers >= history_ledgers` — audit records outlive history.
+    /// - `correction_ledgers >= history_ledgers` — correction traces outlive
+    ///   the history entries they replaced.
+    ///
+    /// See `docs/data-retention-policy.md` for the full policy rationale.
+    pub fn get_retention_policy(env: Env) -> types::DataRetentionPolicy {
+        retention_policy::get_retention_policy(&env)
+    }
+
+    /// Sets the data retention policy. Admin-only.
+    ///
+    /// # Validation
+    ///
+    /// - All windows must be >= 1 ledger.
+    /// - `audit_ledgers >= history_ledgers`
+    /// - `correction_ledgers >= history_ledgers`
+    ///
+    /// Violating any of these causes [`ErrorCode::InvalidConfiguration`].
+    ///
+    /// After setting a new policy, call `apply_retention_policy` to extend
+    /// TTLs of existing records to meet the new minimum windows.
+    ///
+    /// # Errors
+    ///
+    /// - [`ErrorCode::NotAuthorized`] — caller is not the admin.
+    /// - [`ErrorCode::InvalidConfiguration`] — policy parameters are invalid.
+    pub fn set_retention_policy(env: Env, policy: types::DataRetentionPolicy) {
+        let admin = crate::storage::get_admin(&env);
+        admin.require_auth();
+        retention_policy::set_retention_policy(&env, policy);
+        crate::events::emit_admin_action(
+            &env,
+            soroban_sdk::symbol_short!("ret_pol"),
+            admin,
+            soroban_sdk::Bytes::new(&env),
+        );
+    }
+
+    /// Extends TTLs of existing audit log entries to satisfy the current
+    /// retention policy. Admin-only.
+    ///
+    /// `max_entries` caps the number of entries swept in a single call to
+    /// avoid exceeding the invocation budget. Call repeatedly to sweep large
+    /// logs.
+    ///
+    /// Returns the count of entries whose TTLs were extended.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorCode::NotAuthorized`] — caller is not the admin.
+    pub fn apply_retention_policy(env: Env, max_entries: u32) -> u32 {
+        let admin = crate::storage::get_admin(&env);
+        admin.require_auth();
+        retention_policy::apply_retention_to_audit_log(&env, max_entries)
+    }
 }
 
 #[cfg(test)]
@@ -7371,3 +7539,6 @@ mod issues_483_486_tests;
 
 #[cfg(test)]
 mod issues_487_490_tests;
+
+#[cfg(test)]
+mod issues_712_713_714_tests;
