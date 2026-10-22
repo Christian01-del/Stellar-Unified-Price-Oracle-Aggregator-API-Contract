@@ -3,6 +3,11 @@
 //! Implements an append-only audit trail for all admin actions with cryptographic
 //! hash chain to prevent tampering. Each entry includes a SHA-256 hash of the
 //! previous entry, forming an immutable chain.
+//!
+//! Also provides governance participation and concentration guardrails (#662):
+//! transparent indicators for approval concentration, quorum participation, and
+//! inactive signers, computed from the auditable audit records, plus a scheduled
+//! report that alerts when configured thresholds are breached.
 
 use soroban_sdk::{panic_with_error, symbol_short, Address, Bytes, Env, Symbol, Vec};
 
@@ -234,4 +239,179 @@ pub fn get_audit_log_head(env: &Env) -> Bytes {
         .persistent()
         .get(&DataKey::AuditLogHead)
         .unwrap_or_else(|| Bytes::new(env))
+}
+
+// ---------------------------------------------------------------------------
+// Governance participation and concentration guardrails (#662)
+// ---------------------------------------------------------------------------
+
+/// Transparent governance indicators computed from auditable audit records.
+///
+/// All values are expressed in basis points (0..=10_000) so they are
+/// deterministic, integer-only, and easy to compare against thresholds.
+///
+/// * `approval_concentration_bps` - share of admin actions performed by the
+///   single most active signer. High values indicate one signer dominates.
+/// * `quorum_participation_bps` - share of distinct signers that have acted
+///   at least once relative to the total number of known signers.
+/// * `inactive_signers` - number of known signers with no recorded action.
+/// * `total_actions` - total auditable admin actions considered.
+/// * `distinct_signers` - number of distinct signers that have acted.
+/// * `known_signers` - total number of known signers considered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GovernanceIndicators {
+    pub approval_concentration_bps: u32,
+    pub quorum_participation_bps: u32,
+    pub inactive_signers: u32,
+    pub total_actions: u32,
+    pub distinct_signers: u32,
+    pub known_signers: u32,
+}
+
+/// Configured thresholds for governance guardrail alerts.
+///
+/// A report raises an alert for an indicator when its value breaches the
+/// configured threshold. Thresholds are expressed in basis points for the
+/// concentration and participation indicators, and as a raw count for the
+/// inactive signer indicator.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GovernanceThresholds {
+    /// Alert when approval concentration exceeds this value (bps).
+    pub max_approval_concentration_bps: u32,
+    /// Alert when quorum participation falls below this value (bps).
+    pub min_quorum_participation_bps: u32,
+    /// Alert when inactive signers exceed this count.
+    pub max_inactive_signers: u32,
+}
+
+/// Result of a scheduled governance guardrail report.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GovernanceReport {
+    pub indicators: GovernanceIndicators,
+    pub concentration_alert: bool,
+    pub participation_alert: bool,
+    pub inactive_alert: bool,
+    pub ledger: u32,
+    pub timestamp: u64,
+}
+
+impl GovernanceReport {
+    /// Returns true if any configured threshold was breached.
+    pub fn has_alert(&self) -> bool {
+        self.concentration_alert || self.participation_alert || self.inactive_alert
+    }
+}
+
+/// Compute governance indicators from the auditable audit records.
+///
+/// `known_signers` is the set of signers expected to participate (e.g. the
+/// configured admin set). Indicators are derived purely from the append-only
+/// audit log so they are reproducible and auditable.
+///
+/// Boundary conditions:
+/// * zero known signers -> all indicators are zero, no division by zero.
+/// * zero actions -> concentration and participation are zero.
+/// * single signer performing all actions -> concentration is 10_000 bps.
+pub fn compute_governance_indicators(
+    env: &Env,
+    known_signers: &Vec<Address>,
+) -> GovernanceIndicators {
+    let entry_count = get_audit_log_count(env);
+    let known = known_signers.len();
+
+    // Count actions per known signer and track distinct active signers.
+    let mut counts: Vec<u32> = Vec::new(env);
+    for _ in 0..known {
+        counts.push_back(0);
+    }
+
+    let mut total_actions: u32 = 0;
+    let mut i: u32 = 1;
+    while i <= entry_count {
+        if let Some(entry) = env
+            .storage()
+            .persistent()
+            .get::<_, AuditEntry>(&DataKey::AuditEntry(i))
+        {
+            total_actions += 1;
+            let mut j: u32 = 0;
+            while j < known {
+                if known_signers.get(j).unwrap() == entry.admin {
+                    let c = counts.get(j).unwrap();
+                    counts.set(j, c + 1);
+                    break;
+                }
+                j += 1;
+            }
+        }
+        i += 1;
+    }
+
+    // Determine the most active signer and the number of distinct active signers.
+    let mut max_count: u32 = 0;
+    let mut distinct_signers: u32 = 0;
+    let mut j: u32 = 0;
+    while j < known {
+        let c = counts.get(j).unwrap();
+        if c > max_count {
+            max_count = c;
+        }
+        if c > 0 {
+            distinct_signers += 1;
+        }
+        j += 1;
+    }
+
+    let approval_concentration_bps = if total_actions == 0 {
+        0
+    } else {
+        // max_count / total_actions in bps, integer math.
+        (max_count as u64 * 10_000 / total_actions as u64) as u32
+    };
+
+    let quorum_participation_bps = if known == 0 {
+        0
+    } else {
+        (distinct_signers as u64 * 10_000 / known as u64) as u32
+    };
+
+    let inactive_signers = known.saturating_sub(distinct_signers);
+
+    GovernanceIndicators {
+        approval_concentration_bps,
+        quorum_participation_bps,
+        inactive_signers,
+        total_actions,
+        distinct_signers,
+        known_signers: known,
+    }
+}
+
+/// Run the scheduled governance guardrail report.
+///
+/// Computes the indicators from auditable records and evaluates them against
+/// the configured thresholds, producing a report with per-indicator alerts.
+/// This is intended to be invoked on a schedule (e.g. by an operator cron or
+/// an off-chain monitor) and is deterministic for a given ledger state.
+pub fn run_governance_report(
+    env: &Env,
+    known_signers: &Vec<Address>,
+    thresholds: &GovernanceThresholds,
+) -> GovernanceReport {
+    let indicators = compute_governance_indicators(env, known_signers);
+
+    let concentration_alert =
+        indicators.approval_concentration_bps > thresholds.max_approval_concentration_bps;
+    let participation_alert =
+        indicators.quorum_participation_bps < thresholds.min_quorum_participation_bps;
+    let inactive_alert = indicators.inactive_signers > thresholds.max_inactive_signers;
+
+    GovernanceReport {
+        indicators,
+        concentration_alert,
+        participation_alert,
+        inactive_alert,
+        ledger: env.ledger().sequence(),
+        timestamp: env.ledger().timestamp(),
+    }
 }
