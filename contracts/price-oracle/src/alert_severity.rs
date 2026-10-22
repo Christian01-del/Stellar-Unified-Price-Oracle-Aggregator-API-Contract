@@ -10,7 +10,7 @@
 //! Movement is classified against configurable basis-point thresholds:
 //!
 //! | Severity    | Condition                              | Channel   |
-//! |-------------|-----------------------------------------|-----------|
+//!|-------------|-----------------------------------------|-----------|
 //! | `Info`      | `movement_bps < warning_bps`             | —         |
 //! | `Warning`   | `warning_bps <= movement_bps < critical_bps`   | Dashboard |
 //! | `Critical`  | `critical_bps <= movement_bps < emergency_bps` | Page      |
@@ -25,20 +25,22 @@
 //! but are not routed anywhere; they exist purely so operators can distinguish "no
 //! alert has ever fired" from "the last alert was below the warning line".
 //!
-//! ## Incident severity & decision authority matrix
+//! ## Price quality status vocabulary
 //!
-//! Each alert severity maps to an incident severity (`SEV1`–`SEV4`) with a fixed
-//! response role, pause authority, communications requirement, and escalation
-//! deadline. The matrix is the single source of truth used by the tabletop check
-//! (`tabletop_exercise_covers_every_severity`) and documented in
-//! `docs/operations/incident-response.md`.
+//! Consumers need a stable, machine-readable view of how trustworthy a price is.
+//! [`PriceQualityStatus`] defines the canonical vocabulary:
 //!
-//! | Alert       | Incident | Response role        | Pause authority        | Comms                          | Escalation deadline |
-//! |-------------|----------|----------------------|------------------------|--------------------------------|---------------------|
-//! | `Info`      | `SEV4`   | On-call engineer     | None                   | None                           | Next business day   |
-//! | `Warning`   | `SEV3`   | On-call engineer     | None                   | Dashboard status note          | 4 hours             |
-//! | `Critical`  | `SEV2`   | Incident commander   | Incident commander     | Status page + stakeholder ping | 30 minutes          |
-//! | `Emergency` | `SEV1`   | Incident commander   | Incident commander     | Status page + page all + postmortem | 15 minutes      |
+//! | Status        | Meaning                                                        |
+//!|---------------|----------------------------------------------------------------|
+//! | `Fresh`       | Price is within its freshness window and healthy.              |
+//! | `Degraded`    | Price is usable but flagged (e.g. elevated deviation).          |
+//! | `Stale`       | Price exists but is past its freshness window.                 |
+//! | `Unavailable` | No price is available for the asset.                           |
+//! | `Corrected`   | Price was recently corrected after a dispute/override.         |
+//!
+//! [`get_price_quality_status`] maps the existing freshness/health signals into
+//! this vocabulary. Clients MUST handle every variant explicitly and treat any
+//! unknown future discriminant as `Unavailable` (fail safe).
 
 use soroban_sdk::{panic_with_error, Address, Env};
 
@@ -51,119 +53,46 @@ pub const DEFAULT_WARNING_BPS: u32 = 300; // 3%
 pub const DEFAULT_CRITICAL_BPS: u32 = 1_000; // 10%
 pub const DEFAULT_EMERGENCY_BPS: u32 = 2_500; // 25%
 
-// ─── Incident severity & decision authority matrix ─────────────────────────────
+// ─── Price quality status vocabulary ───────────────────────────────────────────
 
-/// Incident severity level (`SEV1`–`SEV4`) derived from an alert severity.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u32)]
-pub enum IncidentSeverity {
-    Sev1 = 1,
-    Sev2 = 2,
-    Sev3 = 3,
-    Sev4 = 4,
-}
-
-/// Who is accountable for driving the response for an incident severity.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ResponseRole {
-    /// On-call engineer triages and resolves; no formal incident command.
-    OnCallEngineer,
-    /// Incident commander owns the response, comms, and escalation.
-    IncidentCommander,
-}
-
-/// Who may pause the oracle for an incident severity.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PauseAuthority {
-    /// No pause is authorized at this severity.
-    None,
-    /// The incident commander may pause the oracle.
-    IncidentCommander,
-}
-
-/// Communications obligations for an incident severity.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Communications {
-    /// No external communications required.
-    None,
-    /// Post a status note on the operator dashboard.
-    DashboardNote,
-    /// Update the public status page and ping stakeholders.
-    StatusPageAndStakeholders,
-    /// Status page, page all responders, and file a postmortem.
-    StatusPagePageAllAndPostmortem,
-}
-
-/// Escalation deadline, expressed in minutes from incident declaration.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EscalationDeadline {
-    /// Escalate by the next business day.
-    NextBusinessDay,
-    /// Escalate within 4 hours.
-    FourHours,
-    /// Escalate within 30 minutes.
-    ThirtyMinutes,
-    /// Escalate within 15 minutes.
-    FifteenMinutes,
-}
-
-impl EscalationDeadline {
-    /// Deadline in minutes; `NextBusinessDay` is reported as 24 hours.
-    pub fn minutes(self) -> u32 {
-        match self {
-            EscalationDeadline::NextBusinessDay => 24 * 60,
-            EscalationDeadline::FourHours => 4 * 60,
-            EscalationDeadline::ThirtyMinutes => 30,
-            EscalationDeadline::FifteenMinutes => 15,
-        }
-    }
-}
-
-/// A single row of the incident severity and decision authority matrix.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct IncidentResponse {
-    pub incident_severity: IncidentSeverity,
-    pub response_role: ResponseRole,
-    pub pause_authority: PauseAuthority,
-    pub communications: Communications,
-    pub escalation_deadline: EscalationDeadline,
-}
-
-/// Maps an alert severity to its incident response row.
+/// Stable machine-readable states describing the quality of a price for consumers.
 ///
-/// This is the authoritative decision table: every alert severity resolves to
-/// exactly one incident severity, response role, pause authority, communications
-/// requirement, and escalation deadline.
-pub fn incident_response_for(severity: AlertSeverity) -> IncidentResponse {
-    match severity {
-        AlertSeverity::Info => IncidentResponse {
-            incident_severity: IncidentSeverity::Sev4,
-            response_role: ResponseRole::OnCallEngineer,
-            pause_authority: PauseAuthority::None,
-            communications: Communications::None,
-            escalation_deadline: EscalationDeadline::NextBusinessDay,
-        },
-        AlertSeverity::Warning => IncidentResponse {
-            incident_severity: IncidentSeverity::Sev3,
-            response_role: ResponseRole::OnCallEngineer,
-            pause_authority: PauseAuthority::None,
-            communications: Communications::DashboardNote,
-            escalation_deadline: EscalationDeadline::FourHours,
-        },
-        AlertSeverity::Critical => IncidentResponse {
-            incident_severity: IncidentSeverity::Sev2,
-            response_role: ResponseRole::IncidentCommander,
-            pause_authority: PauseAuthority::IncidentCommander,
-            communications: Communications::StatusPageAndStakeholders,
-            escalation_deadline: EscalationDeadline::ThirtyMinutes,
-        },
-        AlertSeverity::Emergency => IncidentResponse {
-            incident_severity: IncidentSeverity::Sev1,
-            response_role: ResponseRole::IncidentCommander,
-            pause_authority: PauseAuthority::IncidentCommander,
-            communications: Communications::StatusPagePageAllAndPostmortem,
-            escalation_deadline: EscalationDeadline::FifteenMinutes,
-        },
+/// Discriminants are part of the public ABI: do not renumber existing variants.
+/// New variants may be appended; clients must treat unknown values as
+/// [`PriceQualityStatus::Unavailable`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum PriceQualityStatus {
+    /// Price is within its freshness window and healthy.
+    Fresh = 0,
+    /// Price is usable but flagged (e.g. elevated deviation).
+    Degraded = 1,
+    /// Price exists but is past its freshness window.
+    Stale = 2,
+    /// No price is available for the asset.
+    Unavailable = 3,
+    /// Price was recently corrected after a dispute/override.
+    Corrected = 4,
+}
+
+impl PriceQualityStatus {
+    /// Stable numeric discriminant for the status (part of the public ABI).
+    pub fn as_u32(self) -> u32 {
+        self as u32
+    }
+
+    /// Decodes a numeric discriminant into a status.
+    ///
+    /// Unknown future discriminants fail safe to [`PriceQualityStatus::Unavailable`].
+    pub fn from_u32(value: u32) -> PriceQualityStatus {
+        match value {
+            0 => PriceQualityStatus::Fresh,
+            1 => PriceQualityStatus::Degraded,
+            2 => PriceQualityStatus::Stale,
+            3 => PriceQualityStatus::Unavailable,
+            4 => PriceQualityStatus::Corrected,
+            _ => PriceQualityStatus::Unavailable,
+        }
     }
 }
 
@@ -348,6 +277,44 @@ pub fn evaluate_and_route(
 pub fn get_last_alert_severity(env: &Env, asset: Address) -> Option<AlertSeverity> {
     env.storage()
         .persistent()
-        .get
+        .get(&DataKey::LastAlertSeverity(asset))
+}
 
-/* … truncated 3349 chars — edit only what you need near the top … */
+// ─── Price quality status mapping ──────────────────────────────────────────────
+
+/// Maps the existing freshness/health signals for `asset` into the stable
+/// [`PriceQualityStatus`] vocabulary.
+///
+/// The mapping is conservative: any signal that cannot be positively confirmed
+/// as healthy resolves to a lower-trust state, and a missing price resolves to
+/// [`PriceQualityStatus::Unavailable`].
+///
+/// * No price recorded → `Unavailable`.
+/// * Price flagged as corrected → `Corrected`.
+/// * Price past its freshness window → `Stale`.
+/// * Last alert severity at `Warning` or above → `Degraded`.
+/// * Otherwise → `Fresh`.
+pub fn get_price_quality_status(env: &Env, asset: Address) -> PriceQualityStatus {
+    let price_key = DataKey::Price(asset.clone());
+    let price: Option<crate::types::PriceData> = env.storage().persistent().get(&price_key);
+    let price = match price {
+        Some(p) => p,
+        None => return PriceQualityStatus::Unavailable,
+    };
+
+    if price.corrected {
+        return PriceQualityStatus::Corrected;
+    }
+
+    let now = env.ledger().timestamp();
+    if now > price.timestamp.saturating_add(price.max_age) {
+        return PriceQualityStatus::Stale;
+    }
+
+    match get_last_alert_severity(env, asset) {
+        Some(AlertSeverity::Warning)
+        | Some(AlertSeverity::Critical)
+        | Some(AlertSeverity::Emergency) => PriceQualityStatus::Degraded,
+        _ => PriceQualityStatus::Fresh,
+    }
+}

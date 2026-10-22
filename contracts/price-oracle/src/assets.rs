@@ -9,6 +9,8 @@ use crate::storage::{
 };
 use crate::types::{AssetMetadata, AssetMetadataUpdate, DataKey, ErrorCode, PriceBounds};
 
+pub const MAX_ASSET_QUERY_SIZE: u32 = 100;
+
 pub fn register_asset(env: &Env, asset: Address) {
     let admin = get_admin(env);
     admin.require_auth();
@@ -45,6 +47,48 @@ pub fn register_asset(env: &Env, asset: Address) {
     }
     .publish(env);
     emit_admin_action(env, symbol_short!("reg_asset"), admin, Bytes::new(env));
+}
+
+pub fn get_registered_assets_paginated(
+    env: &Env,
+    cursor: Option<Address>,
+    limit: u32,
+) -> (Vec<Address>, Option<Address>) {
+    if limit == 0 || limit > crate::history::MAX_PAGE_SIZE {
+        panic_with_error!(env, ErrorCode::InvalidPageSize);
+    }
+
+    let registered = read_registered_assets(env);
+    let start = match cursor {
+        Some(last_asset) => {
+            let mut next_index = None;
+            for i in 0..registered.len() {
+                if registered.get_unchecked(i) == last_asset {
+                    next_index = Some(i + 1);
+                    break;
+                }
+            }
+            match next_index {
+                Some(index) => index,
+                None => panic_with_error!(env, ErrorCode::InvalidPageCursor),
+            }
+        }
+        None => 0,
+    };
+
+    let mut page: Vec<Address> = Vec::new(env);
+    let mut index = start;
+    while index < registered.len() && page.len() < limit {
+        page.push_back(registered.get_unchecked(index));
+        index += 1;
+    }
+
+    let next_cursor = if index < registered.len() {
+        Some(page.get_unchecked(page.len() - 1))
+    } else {
+        None
+    };
+    (page, next_cursor)
 }
 
 pub fn unregister_asset(env: &Env, asset: Address) {
