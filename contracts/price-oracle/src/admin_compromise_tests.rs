@@ -274,3 +274,183 @@ fn new_signer_set_cannot_create_unauthorized_transition_outside_scope() {
 fn code(c: ErrorCode) -> soroban_sdk::Error {
     soroban_sdk::Error::from_contract_error(c as u32)
 }
+
+// ---------------------------------------------------------------------------
+// #653 — Production multisig policy and signer eligibility
+// ---------------------------------------------------------------------------
+
+/// Rotation cadence for production signers, in ledgers (~90 days at 5s/ledger).
+const ROTATION_CADENCE_LEDGERS: u32 = 1_555_200;
+/// Maximum age a signer key may reach before it must be rotated.
+const MAX_SIGNER_AGE_LEDGERS: u32 = ROTATION_CADENCE_LEDGERS;
+/// Minimum number of independent signers required for critical actions.
+const MIN_INDEPENDENT_SIGNERS: u32 = 3;
+
+/// A declared conflict of interest on a signer, with optional mitigation.
+struct Conflict {
+    declared: bool,
+    mitigated: bool,
+}
+
+/// A production signer under the multisig policy.
+struct Signer {
+    address: Address,
+    /// Custody/control domain (e.g. org or HSM operator). Signers sharing a
+    /// domain are not independent.
+    custody_domain: u32,
+    /// Ledger at which the key was provisioned; drives rotation cadence.
+    provisioned_at: u32,
+    /// Whether the signer meets eligibility criteria (vetted, bonded, etc.).
+    eligible: bool,
+    conflict: Conflict,
+}
+
+/// Signer independence: no two signers may share a custody/control domain.
+fn signers_are_independent(signers: &[Signer]) -> bool {
+    for (i, a) in signers.iter().enumerate() {
+        for b in signers.iter().skip(i + 1) {
+            if a.custody_domain == b.custody_domain {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Signer eligibility: every signer must be vetted and within rotation age.
+fn signers_are_eligible(signers: &[Signer], now: u32) -> bool {
+    signers.iter().all(|s| {
+        s.eligible && now.saturating_sub(s.provisioned_at) <= MAX_SIGNER_AGE_LEDGERS
+    })
+}
+
+/// A declared conflict must carry a mitigation; an undeclared conflict is
+/// treated as absent. Returns false when a declared conflict lacks mitigation.
+fn conflicts_are_mitigated(signers: &[Signer]) -> bool {
+    signers
+        .iter()
+        .all(|s| !s.conflict.declared || s.conflict.mitigated)
+}
+
+// ---------------------------------------------------------------------------
+// #657 — Emergency action post-incident review workflow
+// ---------------------------------------------------------------------------
+
+/// Maximum ledgers an emergency operation may remain open before its
+/// post-incident review window expires (~7 days at 5s/ledger).
+const REVIEW_WINDOW_LEDGERS: u32 = 120_960;
+
+/// A post-incident review attached to an emergency operation.
+struct PostIncidentReview {
+    /// Accountable owner who signs off on the review.
+    owner: Option<Address>,
+    /// Whether the review has been published (evidence attached).
+    published: bool,
+    /// Ledger at which the emergency operation was opened.
+    opened_at: u32,
+    /// Ledger at which the review was published, if any.
+    published_at: Option<u32>,
+}
+
+impl PostIncidentReview {
+    fn new(opened_at: u32) -> Self {
+        Self {
+            owner: None,
+            published: false,
+            opened_at,
+            published_at: None,
+        }
+    }
+
+    /// Publish the review with an accountable owner and evidence.
+    fn publish(&mut self, owner: Address, now: u32, has_evidence: bool) -> bool {
+        if !has_evidence || self.published {
+            return false;
+        }
+        self.owner = Some(owner);
+        self.published = true;
+        self.published_at = Some(now);
+        true
+    }
+
+    /// Whether the review window has expired relative to `now`.
+    fn window_expired(&self, now: u32) -> bool {
+        now.saturating_sub(self.opened_at) > REVIEW_WINDOW_LEDGERS
+    }
+
+    /// An emergency may only be closed with a published review, an
+    /// accountable owner, and a review window that has not expired.
+    fn can_close(&self, now: u32) -> bool {
+        self.published && self.owner.is_some() && !self.window_expired(now)
+    }
+}
+
+#[test]
+fn emergency_cannot_close_without_published_review() {
+    let e = Env::default();
+    let mut review = PostIncidentReview::new(1_000);
+    // No review published yet: closing is refused.
+    assert!(!review.can_close(1_000));
+    // Publishing without evidence is refused.
+    let owner = Address::generate(&e);
+    assert!(!review.publish(owner.clone(), 1_000, false));
+    assert!(!review.can_close(1_000));
+}
+
+#[test]
+fn emergency_cannot_close_without_accountable_owner() {
+    let e = Env::default();
+    let mut review = PostIncidentReview::new(1_000);
+    // A published review with no owner cannot be closed.
+    review.published = true;
+    review.published_at = Some(1_000);
+    assert!(review.owner.is_none());
+    assert!(!review.can_close(1_000));
+    // Attaching an accountable owner unblocks closure.
+    let owner = Address::generate(&e);
+    assert!(review.publish(owner, 1_000, true));
+    assert!(review.can_close(1_000));
+}
+
+#[test]
+fn emergency_closes_with_published_review_and_owner() {
+    let e = Env::default();
+    let mut review = PostIncidentReview::new(1_000);
+    let owner = Address::generate(&e);
+    assert!(review.publish(owner.clone(), 1_500, true));
+    assert_eq!(review.owner, Some(owner));
+    assert_eq!(review.published_at, Some(1_500));
+    assert!(review.can_close(1_500));
+    // A second publish is refused (review is immutable once published).
+    assert!(!review.publish(Address::generate(&e), 1_600, true));
+}
+
+#[test]
+fn review_window_expiry_blocks_closure() {
+    let e = Env::default();
+    let mut review = PostIncidentReview::new(1_000);
+    let owner = Address::generate(&e);
+    assert!(review.publish(owner, 1_000, true));
+    // At the boundary the window is still open.
+    assert!(!review.window_expired(1_000 + REVIEW_WINDOW_LEDGERS));
+    assert!(review.can_close(1_000 + REVIEW_WINDOW_LEDGERS));
+    // One ledger past the window, closure is refused.
+    assert!(review.window_expired(1_000 + REVIEW_WINDOW_LEDGERS + 1));
+    assert!(!review.can_close(1_000 + REVIEW_WINDOW_LEDGERS + 1));
+}
+
+#[test]
+fn review_recovery_after_window_expiry() {
+    let e = Env::default();
+    let mut review = PostIncidentReview::new(1_000);
+    let owner = Address::generate(&e);
+    assert!(review.publish(owner, 1_000, true));
+    // Window expires: the emergency cannot be closed as-is.
+    let expired_at = 1_000 + REVIEW_WINDOW_LEDGERS + 1;
+    assert!(!review.can_close(expired_at));
+    // Recovery: a fresh review opened within the window restores closure.
+    let mut reopened = PostIncidentReview::new(expired_at);
+    let new_owner = Address::generate(&e);
+    assert!(reopened.publish(new_owner, expired_at, true));
+    assert!(reopened.can_close(expired_at));
+}
