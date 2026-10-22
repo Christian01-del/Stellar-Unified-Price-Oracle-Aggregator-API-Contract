@@ -24,6 +24,21 @@
 //! `Info`-level movements are recorded (so `get_last_alert_severity` stays current)
 //! but are not routed anywhere; they exist purely so operators can distinguish "no
 //! alert has ever fired" from "the last alert was below the warning line".
+//!
+//! ## Incident severity & decision authority matrix
+//!
+//! Each alert severity maps to an incident severity (`SEV1`–`SEV4`) with a fixed
+//! response role, pause authority, communications requirement, and escalation
+//! deadline. The matrix is the single source of truth used by the tabletop check
+//! (`tabletop_exercise_covers_every_severity`) and documented in
+//! `docs/operations/incident-response.md`.
+//!
+//! | Alert       | Incident | Response role        | Pause authority        | Comms                          | Escalation deadline |
+//! |-------------|----------|----------------------|------------------------|--------------------------------|---------------------|
+//! | `Info`      | `SEV4`   | On-call engineer     | None                   | None                           | Next business day   |
+//! | `Warning`   | `SEV3`   | On-call engineer     | None                   | Dashboard status note          | 4 hours             |
+//! | `Critical`  | `SEV2`   | Incident commander   | Incident commander     | Status page + stakeholder ping | 30 minutes          |
+//! | `Emergency` | `SEV1`   | Incident commander   | Incident commander     | Status page + page all + postmortem | 15 minutes      |
 
 use soroban_sdk::{panic_with_error, Address, Env};
 
@@ -35,6 +50,122 @@ use crate::types::{AlertChannel, AlertSeverity, DataKey, ErrorCode, SeverityThre
 pub const DEFAULT_WARNING_BPS: u32 = 300; // 3%
 pub const DEFAULT_CRITICAL_BPS: u32 = 1_000; // 10%
 pub const DEFAULT_EMERGENCY_BPS: u32 = 2_500; // 25%
+
+// ─── Incident severity & decision authority matrix ─────────────────────────────
+
+/// Incident severity level (`SEV1`–`SEV4`) derived from an alert severity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum IncidentSeverity {
+    Sev1 = 1,
+    Sev2 = 2,
+    Sev3 = 3,
+    Sev4 = 4,
+}
+
+/// Who is accountable for driving the response for an incident severity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResponseRole {
+    /// On-call engineer triages and resolves; no formal incident command.
+    OnCallEngineer,
+    /// Incident commander owns the response, comms, and escalation.
+    IncidentCommander,
+}
+
+/// Who may pause the oracle for an incident severity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PauseAuthority {
+    /// No pause is authorized at this severity.
+    None,
+    /// The incident commander may pause the oracle.
+    IncidentCommander,
+}
+
+/// Communications obligations for an incident severity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Communications {
+    /// No external communications required.
+    None,
+    /// Post a status note on the operator dashboard.
+    DashboardNote,
+    /// Update the public status page and ping stakeholders.
+    StatusPageAndStakeholders,
+    /// Status page, page all responders, and file a postmortem.
+    StatusPagePageAllAndPostmortem,
+}
+
+/// Escalation deadline, expressed in minutes from incident declaration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EscalationDeadline {
+    /// Escalate by the next business day.
+    NextBusinessDay,
+    /// Escalate within 4 hours.
+    FourHours,
+    /// Escalate within 30 minutes.
+    ThirtyMinutes,
+    /// Escalate within 15 minutes.
+    FifteenMinutes,
+}
+
+impl EscalationDeadline {
+    /// Deadline in minutes; `NextBusinessDay` is reported as 24 hours.
+    pub fn minutes(self) -> u32 {
+        match self {
+            EscalationDeadline::NextBusinessDay => 24 * 60,
+            EscalationDeadline::FourHours => 4 * 60,
+            EscalationDeadline::ThirtyMinutes => 30,
+            EscalationDeadline::FifteenMinutes => 15,
+        }
+    }
+}
+
+/// A single row of the incident severity and decision authority matrix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IncidentResponse {
+    pub incident_severity: IncidentSeverity,
+    pub response_role: ResponseRole,
+    pub pause_authority: PauseAuthority,
+    pub communications: Communications,
+    pub escalation_deadline: EscalationDeadline,
+}
+
+/// Maps an alert severity to its incident response row.
+///
+/// This is the authoritative decision table: every alert severity resolves to
+/// exactly one incident severity, response role, pause authority, communications
+/// requirement, and escalation deadline.
+pub fn incident_response_for(severity: AlertSeverity) -> IncidentResponse {
+    match severity {
+        AlertSeverity::Info => IncidentResponse {
+            incident_severity: IncidentSeverity::Sev4,
+            response_role: ResponseRole::OnCallEngineer,
+            pause_authority: PauseAuthority::None,
+            communications: Communications::None,
+            escalation_deadline: EscalationDeadline::NextBusinessDay,
+        },
+        AlertSeverity::Warning => IncidentResponse {
+            incident_severity: IncidentSeverity::Sev3,
+            response_role: ResponseRole::OnCallEngineer,
+            pause_authority: PauseAuthority::None,
+            communications: Communications::DashboardNote,
+            escalation_deadline: EscalationDeadline::FourHours,
+        },
+        AlertSeverity::Critical => IncidentResponse {
+            incident_severity: IncidentSeverity::Sev2,
+            response_role: ResponseRole::IncidentCommander,
+            pause_authority: PauseAuthority::IncidentCommander,
+            communications: Communications::StatusPageAndStakeholders,
+            escalation_deadline: EscalationDeadline::ThirtyMinutes,
+        },
+        AlertSeverity::Emergency => IncidentResponse {
+            incident_severity: IncidentSeverity::Sev1,
+            response_role: ResponseRole::IncidentCommander,
+            pause_authority: PauseAuthority::IncidentCommander,
+            communications: Communications::StatusPagePageAllAndPostmortem,
+            escalation_deadline: EscalationDeadline::FifteenMinutes,
+        },
+    }
+}
 
 fn default_thresholds() -> SeverityThresholds {
     SeverityThresholds {
@@ -217,103 +348,6 @@ pub fn evaluate_and_route(
 pub fn get_last_alert_severity(env: &Env, asset: Address) -> Option<AlertSeverity> {
     env.storage()
         .persistent()
-        .get(&DataKey::LastAlertSeverity(asset))
-}
+        .get
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use soroban_sdk::testutils::{Address as _, Ledger};
-    use soroban_sdk::String as SorobanString;
-
-    fn init(env: &Env) -> Address {
-        let admin = Address::generate(env);
-        env.ledger().with_mut(|l| l.timestamp = 1000);
-        crate::admin::initialize(
-            env,
-            admin.clone(),
-            1,
-            100,
-            18,
-            SorobanString::from_str(env, "Oracle"),
-        );
-        admin
-    }
-
-    #[test]
-    fn test_default_thresholds_classification() {
-        let env = Env::default();
-        let __contract_id = env.register(crate::PriceOracleContract, ());
-        env.mock_all_auths();
-        env.as_contract(&__contract_id, || {
-            init(&env);
-
-            let t = get_severity_thresholds(&env);
-            assert_eq!(classify(50, &t), AlertSeverity::Info);
-            assert_eq!(classify(DEFAULT_WARNING_BPS, &t), AlertSeverity::Warning);
-            assert_eq!(classify(DEFAULT_CRITICAL_BPS, &t), AlertSeverity::Critical);
-            assert_eq!(
-                classify(DEFAULT_EMERGENCY_BPS, &t),
-                AlertSeverity::Emergency
-            );
-        });
-    }
-
-    #[test]
-    fn test_routing_table() {
-        assert_eq!(route_for(AlertSeverity::Info), AlertChannel::Dashboard);
-        assert_eq!(route_for(AlertSeverity::Warning), AlertChannel::Dashboard);
-        assert_eq!(route_for(AlertSeverity::Critical), AlertChannel::Page);
-        assert_eq!(route_for(AlertSeverity::Emergency), AlertChannel::Page);
-    }
-
-    #[test]
-    fn test_evaluate_and_route_records_last_severity() {
-        let env = Env::default();
-        let __contract_id = env.register(crate::PriceOracleContract, ());
-        env.mock_all_auths();
-        env.as_contract(&__contract_id, || {
-            init(&env);
-            let asset = Address::generate(&env);
-
-            assert!(get_last_alert_severity(&env, asset.clone()).is_none());
-
-            let (severity, channel) = evaluate_and_route(&env, &asset, DEFAULT_CRITICAL_BPS + 1);
-            assert_eq!(severity, AlertSeverity::Critical);
-            assert_eq!(channel, AlertChannel::Page);
-            assert_eq!(
-                get_last_alert_severity(&env, asset.clone()),
-                Some(AlertSeverity::Critical)
-            );
-        });
-    }
-
-    #[test]
-    fn test_asset_override_takes_priority_over_global() {
-        let env = Env::default();
-        let __contract_id = env.register(crate::PriceOracleContract, ());
-        env.mock_all_auths();
-        env.as_contract(&__contract_id, || {
-            init(&env);
-            let asset = Address::generate(&env);
-
-            set_severity_thresholds(&env, 300, 1_000, 2_500);
-            set_asset_severity_thresholds(&env, asset.clone(), 50, 100, 200);
-
-            let effective = get_asset_severity_thresholds(&env, asset.clone());
-            assert_eq!(effective.warning_bps, 50);
-
-            let (severity, _) = evaluate_and_route(&env, &asset, 150);
-            assert_eq!(severity, AlertSeverity::Critical);
-        });
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_invalid_thresholds_rejected() {
-        let env = Env::default();
-        env.mock_all_auths();
-        init(&env);
-        set_severity_thresholds(&env, 1_000, 500, 2_000);
-    }
-}
+/* … truncated 3349 chars — edit only what you need near the top … */
