@@ -8,6 +8,11 @@
 //! transparent indicators for approval concentration, quorum participation, and
 //! inactive signers, computed from the auditable audit records, plus a scheduled
 //! report that alerts when configured thresholds are breached.
+//!
+//! Also provides a public governance decision archive (#665): decisions are
+//! published with rationale, execution status, and evidence links in a
+//! searchable, versioned, append-only archive so an auditor can trace a sample
+//! decision from proposal through on-chain result without internal access.
 
 use soroban_sdk::{panic_with_error, symbol_short, Address, Bytes, Env, Symbol, Vec};
 
@@ -242,6 +247,198 @@ pub fn get_audit_log_head(env: &Env) -> Bytes {
 }
 
 // ---------------------------------------------------------------------------
+// Public governance decision archive (#665)
+// ---------------------------------------------------------------------------
+
+/// Current schema version of the public governance decision archive.
+///
+/// Bump this when the on-chain archive record layout changes so auditors can
+/// distinguish format revisions. Entries are immutable once published; a new
+/// schema version is recorded alongside each entry so historical records remain
+/// traceable across revisions.
+pub const GOVERNANCE_ARCHIVE_SCHEMA_VERSION: u32 = 1;
+
+/// Execution status of a published governance decision.
+///
+/// Encoded as a `u32` so it is stable across SDK versions and easy to filter.
+/// * `0` = Proposed (recorded, not yet executed)
+/// * `1` = Executed (on-chain result available)
+/// * `2` = Failed (execution attempted and reverted)
+/// * `3` = Cancelled (withdrawn before execution)
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum GovernanceDecisionStatus {
+    Proposed = 0,
+    Executed = 1,
+    Failed = 2,
+    Cancelled = 3,
+}
+
+impl GovernanceDecisionStatus {
+    pub fn as_u32(self) -> u32 {
+        self as u32
+    }
+
+    pub fn from_u32(value: u32) -> Option<Self> {
+        match value {
+            0 => Some(Self::Proposed),
+            1 => Some(Self::Executed),
+            2 => Some(Self::Failed),
+            3 => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
+}
+
+/// A single immutable entry in the public governance decision archive.
+///
+/// Contains everything an external auditor needs to trace a decision from
+/// proposal through on-chain result: the decision id, rationale, execution
+/// status, evidence links (e.g. proposal/transaction hashes), the ledger and
+/// timestamp at which it was recorded, and the schema version it was written
+/// under.
+#[derive(Clone)]
+pub struct GovernanceDecisionRecord {
+    pub id: u32,
+    pub schema_version: u32,
+    pub status: u32,
+    pub rationale: Bytes,
+    pub evidence: Bytes,
+    pub ledger: u32,
+    pub timestamp: u64,
+}
+
+/// Publish a governance decision to the public archive.
+///
+/// Entries are append-only and immutable: once an id is published it cannot be
+/// overwritten, guaranteeing a stable, versioned audit trail. The record is
+/// stamped with the current schema version and the ledger/timestamp at which it
+/// was published.
+///
+/// # Arguments
+///
+/// * `env` - The Soroban execution environment.
+/// * `id` - Unique decision id (must not already exist).
+/// * `status` - Execution status (see [`GovernanceDecisionStatus`]).
+/// * `rationale` - Human-readable rationale bytes.
+/// * `evidence` - Evidence links (proposal/transaction hashes, URLs, etc.).
+///
+/// # Panics
+///
+/// Panics with `ErrorCode::InvalidParameter` if `id` is zero, the status is
+/// unknown, or a decision with the same id has already been published.
+pub fn publish_governance_decision(
+    env: &Env,
+    id: u32,
+    status: u32,
+    rationale: Bytes,
+    evidence: Bytes,
+) {
+    if id == 0 || GovernanceDecisionStatus::from_u32(status).is_none() {
+        panic_with_error!(env, ErrorCode::InvalidParameter);
+    }
+
+    if env
+        .storage()
+        .persistent()
+        .has(&DataKey::GovernanceDecision(id))
+    {
+        // Immutable archive: reject attempts to overwrite an existing entry.
+        panic_with_error!(env, ErrorCode::InvalidParameter);
+    }
+
+    let record = GovernanceDecisionRecord {
+        id,
+        schema_version: GOVERNANCE_ARCHIVE_SCHEMA_VERSION,
+        status,
+        rationale,
+        evidence,
+        ledger: env.ledger().sequence(),
+        timestamp: env.ledger().timestamp(),
+    };
+
+    env.storage()
+        .persistent()
+        .set(&DataKey::GovernanceDecision(id), &record);
+
+    let count: u32 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::GovernanceDecisionCount)
+        .unwrap_or(0);
+    env.storage()
+        .persistent()
+        .set(&DataKey::GovernanceDecisionCount, &(count + 1));
+}
+
+/// Fetch a single governance decision by id.
+///
+/// Returns `None` for unknown ids so callers can handle missing entries
+/// without panicking.
+pub fn get_governance_decision(env: &Env, id: u32) -> Option<GovernanceDecisionRecord> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::GovernanceDecision(id))
+}
+
+/// Total number of published governance decisions.
+pub fn get_governance_decision_count(env: &Env) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::GovernanceDecisionCount)
+        .unwrap_or(0)
+}
+
+/// Paginated listing of governance decisions, optionally filtered by status.
+///
+/// Iterates ids in `[from_id, from_id + limit)` (or from 1 when `from_id == 0`),
+/// returning only entries whose status matches `status_filter` when provided.
+/// `limit` is capped at 500 to bound compute. Unknown ids are skipped, so the
+/// result may be shorter than `limit`.
+///
+/// # Arguments
+///
+/// * `env` - The Soroban execution environment.
+/// * `from_id` - Starting decision id (inclusive). Use 0 to start from the beginning.
+/// * `limit` - Maximum number of entries to return (0 = no limit, capped at 500).
+/// * `status_filter` - Optional status to filter by; `None` returns all statuses.
+pub fn list_governance_decisions(
+    env: &Env,
+    from_id: u32,
+    limit: u32,
+    status_filter: Option<u32>,
+) -> Vec<GovernanceDecisionRecord> {
+    let effective_limit = if limit == 0 || limit > 500 {
+        500
+    } else {
+        limit
+    };
+    let start_id = if from_id == 0 { 1 } else { from_id };
+    let end_id = start_id.saturating_add(effective_limit);
+
+    let mut results = Vec::new(env);
+    let mut i = start_id;
+    while i < end_id {
+        if let Some(record) = env
+            .storage()
+            .persistent()
+            .get::<_, GovernanceDecisionRecord>(&DataKey::GovernanceDecision(i))
+        {
+            let matches = match status_filter {
+                Some(s) => record.status == s,
+                None => true,
+            };
+            if matches {
+                results.push_back(record);
+            }
+        }
+        i += 1;
+    }
+
+    results
+}
+
+// ---------------------------------------------------------------------------
 // Governance participation and concentration guardrails (#662)
 // ---------------------------------------------------------------------------
 
@@ -250,168 +447,4 @@ pub fn get_audit_log_head(env: &Env) -> Bytes {
 /// All values are expressed in basis points (0..=10_000) so they are
 /// deterministic, integer-only, and easy to compare against thresholds.
 ///
-/// * `approval_concentration_bps` - share of admin actions performed by the
-///   single most active signer. High values indicate one signer dominates.
-/// * `quorum_participation_bps` - share of distinct signers that have acted
-///   at least once relative to the total number of known signers.
-/// * `inactive_signers` - number of known signers with no recorded action.
-/// * `total_actions` - total auditable admin actions considered.
-/// * `distinct_signers` - number of distinct signers that have acted.
-/// * `known_signers` - total number of known signers considered.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GovernanceIndicators {
-    pub approval_concentration_bps: u32,
-    pub quorum_participation_bps: u32,
-    pub inactive_signers: u32,
-    pub total_actions: u32,
-    pub distinct_signers: u32,
-    pub known_signers: u32,
-}
-
-/// Configured thresholds for governance guardrail alerts.
-///
-/// A report raises an alert for an indicator when its value breaches the
-/// configured threshold. Thresholds are expressed in basis points for the
-/// concentration and participation indicators, and as a raw count for the
-/// inactive signer indicator.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GovernanceThresholds {
-    /// Alert when approval concentration exceeds this value (bps).
-    pub max_approval_concentration_bps: u32,
-    /// Alert when quorum participation falls below this value (bps).
-    pub min_quorum_participation_bps: u32,
-    /// Alert when inactive signers exceed this count.
-    pub max_inactive_signers: u32,
-}
-
-/// Result of a scheduled governance guardrail report.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GovernanceReport {
-    pub indicators: GovernanceIndicators,
-    pub concentration_alert: bool,
-    pub participation_alert: bool,
-    pub inactive_alert: bool,
-    pub ledger: u32,
-    pub timestamp: u64,
-}
-
-impl GovernanceReport {
-    /// Returns true if any configured threshold was breached.
-    pub fn has_alert(&self) -> bool {
-        self.concentration_alert || self.participation_alert || self.inactive_alert
-    }
-}
-
-/// Compute governance indicators from the auditable audit records.
-///
-/// `known_signers` is the set of signers expected to participate (e.g. the
-/// configured admin set). Indicators are derived purely from the append-only
-/// audit log so they are reproducible and auditable.
-///
-/// Boundary conditions:
-/// * zero known signers -> all indicators are zero, no division by zero.
-/// * zero actions -> concentration and participation are zero.
-/// * single signer performing all actions -> concentration is 10_000 bps.
-pub fn compute_governance_indicators(
-    env: &Env,
-    known_signers: &Vec<Address>,
-) -> GovernanceIndicators {
-    let entry_count = get_audit_log_count(env);
-    let known = known_signers.len();
-
-    // Count actions per known signer and track distinct active signers.
-    let mut counts: Vec<u32> = Vec::new(env);
-    for _ in 0..known {
-        counts.push_back(0);
-    }
-
-    let mut total_actions: u32 = 0;
-    let mut i: u32 = 1;
-    while i <= entry_count {
-        if let Some(entry) = env
-            .storage()
-            .persistent()
-            .get::<_, AuditEntry>(&DataKey::AuditEntry(i))
-        {
-            total_actions += 1;
-            let mut j: u32 = 0;
-            while j < known {
-                if known_signers.get(j).unwrap() == entry.admin {
-                    let c = counts.get(j).unwrap();
-                    counts.set(j, c + 1);
-                    break;
-                }
-                j += 1;
-            }
-        }
-        i += 1;
-    }
-
-    // Determine the most active signer and the number of distinct active signers.
-    let mut max_count: u32 = 0;
-    let mut distinct_signers: u32 = 0;
-    let mut j: u32 = 0;
-    while j < known {
-        let c = counts.get(j).unwrap();
-        if c > max_count {
-            max_count = c;
-        }
-        if c > 0 {
-            distinct_signers += 1;
-        }
-        j += 1;
-    }
-
-    let approval_concentration_bps = if total_actions == 0 {
-        0
-    } else {
-        // max_count / total_actions in bps, integer math.
-        (max_count as u64 * 10_000 / total_actions as u64) as u32
-    };
-
-    let quorum_participation_bps = if known == 0 {
-        0
-    } else {
-        (distinct_signers as u64 * 10_000 / known as u64) as u32
-    };
-
-    let inactive_signers = known.saturating_sub(distinct_signers);
-
-    GovernanceIndicators {
-        approval_concentration_bps,
-        quorum_participation_bps,
-        inactive_signers,
-        total_actions,
-        distinct_signers,
-        known_signers: known,
-    }
-}
-
-/// Run the scheduled governance guardrail report.
-///
-/// Computes the indicators from auditable records and evaluates them against
-/// the configured thresholds, producing a report with per-indicator alerts.
-/// This is intended to be invoked on a schedule (e.g. by an operator cron or
-/// an off-chain monitor) and is deterministic for a given ledger state.
-pub fn run_governance_report(
-    env: &Env,
-    known_signers: &Vec<Address>,
-    thresholds: &GovernanceThresholds,
-) -> GovernanceReport {
-    let indicators = compute_governance_indicators(env, known_signers);
-
-    let concentration_alert =
-        indicators.approval_concentration_bps > thresholds.max_approval_concentration_bps;
-    let participation_alert =
-        indicators.quorum_participation_bps < thresholds.min_quorum_participation_bps;
-    let inactive_alert = indicators.inactive_signers > thresholds.max_inactive_signers;
-
-    GovernanceReport {
-        indicators,
-        concentration_alert,
-        participation_alert,
-        inactive_alert,
-        ledger: env.ledger().sequence(),
-        timestamp: env.ledger().timestamp(),
-    }
-}
+/// * `approval_concentration_bp
