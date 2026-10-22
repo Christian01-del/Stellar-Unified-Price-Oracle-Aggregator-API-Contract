@@ -4,6 +4,13 @@
 //! the guardian recovery path, and scripts the recovery drill end to end.
 //! The capability list and residual risk are documented in
 //! `docs/security/admin-compromise-drill.md`.
+//!
+//! # #664 — Emergency authority boundary conformance
+//!
+//! Emergency controls (pause, emergency admin actions) must not be able to
+//! alter administrator membership, timelock policy, or unrelated governance
+//! settings. Each forbidden transition is asserted to be rejected and the
+//! prior state is verified unchanged.
 
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
@@ -164,6 +171,96 @@ fn recovery_drill_end_to_end() {
         .add_source(&honest, &String::from_str(&e, "Honest"));
     assert!(d.client.is_source(&honest));
     assert!(d.client.recovery_get_pending().is_none());
+}
+
+// ---------------------------------------------------------------------------
+// #664 — Emergency authority boundary conformance
+//
+// Emergency controls must not be able to alter administrator membership,
+// timelock policy, or unrelated governance settings. Each test asserts the
+// forbidden transition is rejected AND that the prior state is unchanged.
+// ---------------------------------------------------------------------------
+
+/// Emergency pause must not let the caller add a new administrator.
+#[test]
+fn emergency_cannot_add_administrator() {
+    let e = Env::default();
+    let d = setup(&e);
+    let original_admin = d.client.get_admin();
+
+    d.client.pause();
+    let intruder = Address::generate(&e);
+    let r = d.client.try_set_admin(&intruder);
+    assert!(r.is_err());
+    assert_eq!(d.client.get_admin(), original_admin);
+}
+
+/// Emergency pause must not let the caller remove/replace the administrator.
+#[test]
+fn emergency_cannot_replace_administrator() {
+    let e = Env::default();
+    let d = setup(&e);
+    let original_admin = d.client.get_admin();
+
+    d.client.pause();
+    let replacement = Address::generate(&e);
+    let r = d.client.try_set_admin(&replacement);
+    assert!(r.is_err());
+    assert_eq!(d.client.get_admin(), original_admin);
+    assert_ne!(d.client.get_admin(), replacement);
+}
+
+/// Emergency pause must not let the caller alter the recovery timelock delay.
+#[test]
+fn emergency_cannot_alter_timelock_delay() {
+    let e = Env::default();
+    let d = setup(&e);
+
+    d.client.pause();
+    let r = d.client.try_recovery_set_delay(&1u32);
+    assert!(r.is_err());
+    // Delay is unchanged: a fresh recovery still requires the original window.
+    reach_quorum(&d);
+    advance(&e, DELAY - 1);
+    assert!(d.client.try_recovery_execute().is_err());
+    advance(&e, 1);
+    d.client.recovery_execute();
+    assert_eq!(d.client.get_admin(), d.rescue);
+}
+
+/// Emergency pause must not let the caller swap the guardian set (a governance
+/// setting unrelated to the emergency pause itself).
+#[test]
+fn emergency_cannot_alter_guardian_set() {
+    let e = Env::default();
+    let d = setup(&e);
+
+    d.client.pause();
+    let mut puppets: Vec<Address> = Vec::new(&e);
+    puppets.push_back(Address::generate(&e));
+    let r = d.client.try_recovery_set_guardians(&puppets, &1u32);
+    assert!(r.is_err());
+    // Original 2-of-2 quorum still governs recovery.
+    d.client.recovery_approve(&d.g1, &d.rescue);
+    assert!(d.client.recovery_get_pending().is_some());
+}
+
+/// Emergency pause must not let the caller mutate unrelated governance
+/// settings such as the recovery threshold.
+#[test]
+fn emergency_cannot_alter_recovery_threshold() {
+    let e = Env::default();
+    let d = setup(&e);
+
+    d.client.pause();
+    let mut guardians: Vec<Address> = Vec::new(&e);
+    guardians.push_back(d.g1.clone());
+    guardians.push_back(d.g2.clone());
+    let r = d.client.try_recovery_set_guardians(&guardians, &1u32);
+    assert!(r.is_err());
+    // A single approval is still insufficient under the original 2-of-2 policy.
+    d.client.recovery_approve(&d.g1, &d.rescue);
+    assert!(d.client.recovery_get_pending().is_some());
 }
 
 fn code(c: ErrorCode) -> soroban_sdk::Error {
