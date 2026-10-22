@@ -6625,661 +6625,390 @@ impl PriceOracleContract {
         recompute::is_excluded(&env, &source)
     }
 
-    /// Returns the assets whose aggregates a change to `source` would
-    /// re-derive (#483).
-    pub fn get_recompute_affected_assets(env: Env, source: Address) -> soroban_sdk::Vec<Address> {
-        recompute::affected_assets(&env, &source)
-    }
+#![no_std]
 
-    // ── #484 Two-tier price bounds ──────────────────────────────────────────
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol, Vec};
 
-    /// Sets the soft/hard price bounds for `asset` (#484).
-    ///
-    /// Ordering is validated on write: `0 < hard_min <= soft_min <=
-    /// soft_max <= hard_max`. A value outside the soft band is clamped and
-    /// flagged; a value outside the hard band is rejected and not published.
-    pub fn set_price_bounds_tier(env: Env, asset: Address, tier: types::BoundsTier) {
-        price_bounds::set_bounds(&env, asset, tier);
-    }
+/// A single recorded reward measurement for a source in an epoch.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RewardRecord {
+    pub source: Address,
+    pub epoch: u64,
+    pub amount: i128,
+    pub recorded_at: u64,
+}
 
-    /// Returns the soft/hard bounds configured for `asset`, if any (#484).
-    pub fn get_price_bounds_tier(env: Env, asset: Address) -> Option<types::BoundsTier> {
-        price_bounds::get_bounds(&env, &asset)
-    }
+/// An appeal filed by a source disputing a measured contribution or payout.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Appeal {
+    pub id: u64,
+    pub source: Address,
+    pub epoch: u64,
+    pub disputed_amount: i128,
+    pub reason: Symbol,
+    pub filed_at: u64,
+    pub resolved: bool,
+}
 
-    /// Clears the soft/hard bounds for `asset` (#484).
-    pub fn clear_price_bounds_tier(env: Env, asset: Address) {
-        price_bounds::clear_bounds(&env, asset);
-    }
+/// A correction appended when an appeal is approved. It references the
+/// original record and the appeal that produced it, preserving the audit trail.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Correction {
+    pub appeal_id: u64,
+    pub source: Address,
+    pub epoch: u64,
+    pub original_amount: i128,
+    pub corrected_amount: i128,
+    pub approved_by: Address,
+    pub recorded_at: u64,
+}
 
-    /// Returns the last bound decision for `asset` — raw value, published
-    /// value, `clamped` / `rejected` flags and the reason code (#484).
-    ///
-    /// Consumers must read this whenever they publish or use an aggregate for
-    /// an asset with bounds configured; see `docs/price-bounds-tiers.md`.
-    pub fn get_price_bound_status(env: Env, asset: Address) -> Option<types::BoundStatus> {
-        price_bounds::get_status(&env, &asset)
-    }
+/// Published fee assumptions for a schedule review (issue #675).
+///
+/// All amounts are in stroops (1 XLM = 10_000_000 stroops). The schedule is
+/// disclosed in `docs/fee-schedule.md`; this struct is the machine-readable
+/// form used by the reproducible consumer-impact calculation.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeSchedule {
+    /// Flat fee charged per submitted update, in stroops.
+    pub base_fee: i128,
+    /// Additional fee per asset covered by an update, in stroops.
+    pub per_asset_fee: i128,
+    /// Additional fee per update beyond the first in a batch, in stroops.
+    pub per_update_fee: i128,
+    /// Storage/rent fee per asset per epoch, in stroops.
+    pub storage_fee_per_asset: i128,
+    /// Volume tier threshold in updates; at or above it the tier discount
+    /// applies. Zero disables tiering.
+    pub tier_threshold: u64,
+    /// Discount applied to the variable fees at/above the tier threshold,
+    /// expressed in basis points (e.g. 1000 = 10%).
+    pub tier_discount_bps: u32,
+}
 
-    // ── #485 Deferred / quorum-within-window aggregation ────────────────────
+/// Result of the consumer-impact calculation for one integration profile.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeImpact {
+    /// Total fee for the profile, in stroops.
+    pub total_fee: i128,
+    /// Fee as a fraction of gross value, in basis points.
+    pub effective_bps: u32,
+}
 
-    /// Sets the deferral policy for `asset` (#485).
-    ///
-    /// Bounds: `1 <= quorum <= 64`, `1 <= window_secs <= 86_400` and
-    /// `window_secs <= max_defer_secs <= 604_800`. Until `quorum` sources
-    /// submit inside the window the asset is explicitly `Deferred`, and past
-    /// `max_defer_secs` it becomes `Stale`.
-    pub fn set_deferral_policy(env: Env, asset: Address, policy: types::DeferralPolicy) {
-        deferral::set_policy(&env, asset, policy);
-    }
+/// Reward budget state (issue #676).
+///
+/// `total_budget` is the hard cap on cumulative payouts. `paid_out` tracks
+/// the cumulative amount already paid. `allow_partial` is the explicit
+/// policy switch: when false (default) a payout that would exceed the
+/// remaining allocation fails atomically; when true the payout is clamped
+/// to the remaining allocation.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RewardBudget {
+    pub total_budget: i128,
+    pub paid_out: i128,
+    pub allow_partial: bool,
+}
 
-    /// Returns the deferral policy for `asset`, if any (#485).
-    pub fn get_deferral_policy(env: Env, asset: Address) -> Option<types::DeferralPolicy> {
-        deferral::get_policy(&env, &asset)
-    }
+/// Version-tagged incentive policy (issue #677).
+///
+/// `version` is the policy version this parameter set belongs to. Accrued
+/// rewards are tracked separately and are never recomputed on a version
+/// bump; existing participants are grandfathered under the version that
+/// was active when their rewards accrued.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IncentivePolicy {
+    pub version: u32,
+    /// Reward rate in basis points applied to measured contribution.
+    pub reward_rate_bps: u32,
+    /// Minimum contribution (in stroops) that accrues any reward.
+    pub min_contribution: i128,
+}
 
-    /// Removes the deferral policy for `asset`, restoring the default
-    /// publication trigger (#485).
-    pub fn clear_deferral_policy(env: Env, asset: Address) {
-        deferral::clear_policy(&env, asset);
-    }
+/// Accrued reward balance for a participant, tagged with the policy version
+/// under which it accrued. Migration preserves `amount` verbatim.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Accrual {
+    pub participant: Address,
+    pub amount: i128,
+    pub version: u32,
+}
 
-    /// Returns the publication state of `asset` — `Absent`, `Deferred`,
-    /// `Published` or `Stale` — together with the missing-source count
-    /// (#485). `None` when the asset never opted into deferral.
-    pub fn get_publication_status(env: Env, asset: Address) -> Option<types::PublicationStatus> {
-        deferral::get_status(&env, &asset)
-    }
+/// Result of a policy migration, for auditability.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationResult {
+    pub from_version: u32,
+    pub to_version: u32,
+    /// Total accrued balance before migration (conserved).
+    pub total_accrued: i128,
+    /// Number of participant accruals carried over.
+    pub participants: u32,
+}
 
-    // ── #531 Staged percentage config rollout ─────────────────────────────
+#[contracttype]
+#[derive(Clone)]
+pub enum DataKey {
+    Admin,
+    NextAppealId,
+    Appeal(u64),
+    Corrections(u64),
+    Budget,
+    Policy,
+    Accruals,
+}
 
-    /// Starts a staged rollout of `candidate` to `percent` of assets (#531).
-    pub fn start_config_rollout(
-        env: Env,
-        candidate: staged_rollout::StagedConfig,
-        percent: u32,
-        gate: staged_rollout::HealthGate,
-    ) {
-        staged_rollout::start(&env, candidate, percent, gate);
-    }
+#[contract]
+pub struct PriceOracle;
 
-    /// Widens the active rollout to `percent` of assets (#531).
-    pub fn advance_config_rollout(env: Env, percent: u32) {
-        staged_rollout::advance(&env, percent);
-    }
-
-    /// Promotes the rollout candidate to the baseline (#531).
-    pub fn complete_config_rollout(env: Env) {
-        staged_rollout::complete(&env);
-    }
-
-    /// Rolls the active rollout back to the baseline (#531).
-    pub fn rollback_config_rollout(env: Env) {
-        staged_rollout::rollback(&env);
-    }
-
-    /// Records a health sample; returns `true` if it triggered rollback (#531).
-    pub fn report_rollout_health(env: Env, healthy: bool) -> bool {
-        staged_rollout::report_health(&env, healthy)
-    }
-
-    /// Configuration in force for `asset` under any active rollout (#531).
-    pub fn get_effective_config(env: Env, asset: Address) -> staged_rollout::StagedConfig {
-        staged_rollout::effective_config(&env, &asset)
-    }
-
-    /// The active rollout, if any (#531).
-    pub fn get_config_rollout(env: Env) -> Option<staged_rollout::Rollout> {
-        staged_rollout::active(&env)
-    }
-
-    // ── #486 Price corrections with a revision audit trail ──────────────────
-
-    /// Sets the correction limits: which assets may be corrected, how long a
-    /// published aggregate stays correctable, and how many corrections an
-    /// asset may accumulate (#486). Admin only; clamped to the hard maxima.
-    pub fn set_correction_scope(env: Env, scope: corrections::CorrectionScope) {
-        corrections::set_correction_scope(&env, scope);
-    }
-
-    /// Returns the correction limits currently in force (#486).
-    pub fn get_correction_scope(env: Env) -> corrections::CorrectionScope {
-        corrections::get_correction_scope(&env)
-    }
-
-    /// Corrects the published aggregate for `asset` to `new_price` and returns
-    /// the index of the new revision (#486).
-    ///
-    /// Admin-only, and bounded on asset scope, age and count. A non-empty
-    /// `reason` is mandatory. The original publication is preserved and the
-    /// full chain stays queryable via `get_price_revisions`.
-    pub fn correct_price(env: Env, asset: Address, new_price: i128, reason: String) -> u32 {
-        reentrancy::enter(&env);
-        let index = corrections::correct_price(&env, asset, new_price, reason);
-        reentrancy::exit(&env);
-        index
-    }
-
-    /// Returns the full revision chain for `asset`, oldest first (#486).
-    pub fn get_price_revisions(env: Env, asset: Address) -> soroban_sdk::Vec<types::PriceRevision> {
-        corrections::get_revisions(&env, &asset)
-    }
-
-    /// Returns revision `index` of `asset`'s chain, or `None` when the chain
-    /// is shorter (#486).
-    pub fn get_price_revision(
-        env: Env,
-        asset: Address,
-        index: u32,
-    ) -> Option<types::PriceRevision> {
-        corrections::get_revision(&env, &asset, index)
-    }
-
-    /// Returns the first-ever published value for `asset`, which corrections
-    /// never overwrite (#486).
-    pub fn get_original_price(env: Env, asset: Address) -> Option<i128> {
-        corrections::get_original_price(&env, &asset)
-    }
-
-    /// Returns the number of corrections applied to `asset` (#486).
-    pub fn get_correction_count(env: Env, asset: Address) -> u32 {
-        corrections::correction_count(&env, &asset)
-    }
-
-    // ── #487 Asset risk tiers ───────────────────────────────────────────────
-
-    /// Assigns a risk tier to `asset`, or clears it with `None` (#487).
-    ///
-    /// Admin only. A non-empty `reason` is mandatory and travels with the
-    /// `AssetTierChangedEvent`, so every tier move is attributable. The change
-    /// is atomic and affects only *future* aggregations: values already
-    /// published under the previous tier keep the meaning they had.
-    pub fn set_asset_risk_tier(env: Env, asset: Address, tier: Option<RiskTier>, reason: String) {
-        risk_tier::set_tier(&env, asset, tier, reason);
-    }
-
-    /// Returns the tier assigned to `asset`, if any (#487).
-    pub fn get_asset_risk_tier(env: Env, asset: Address) -> Option<RiskTier> {
-        risk_tier::get_tier(&env, &asset)
-    }
-
-    /// Returns `true` when `asset` has a valid tier (#487).
-    ///
-    /// This is the fail-closed predicate: `false` means the asset is
-    /// unconfigured and publishes nothing, not that it falls back to defaults.
-    pub fn has_asset_risk_tier(env: Env, asset: Address) -> bool {
-        risk_tier::require_tier(&env, &asset)
-    }
-
-    /// Makes a valid tier mandatory for every registered asset (#487).
-    ///
-    /// Admin only. Turning this on asserts that every registered asset already
-    /// carries a valid tier; if any does not, the call is refused. Once on, an
-    /// asset with no valid tier publishes nothing instead of falling back to
-    /// the global defaults.
-    pub fn set_risk_tier_enforcement(env: Env, enabled: bool) {
-        risk_tier::set_enforcement(&env, enabled);
-    }
-
-    /// Returns `true` when mandatory tier assignment is in force (#487).
-    pub fn get_risk_tier_enforcement(env: Env) -> bool {
-        risk_tier::enforcement_flag(&env)
-    }
-
-    /// Returns the fixed parameters of every tier, indexed by discriminant
-    /// (#487). The set is closed, so this is a complete view of the presets.
-    pub fn get_risk_tier_params(env: Env) -> soroban_sdk::Vec<TierParams> {
-        let mut out = soroban_sdk::Vec::new(&env);
-        for p in risk_tier::TIER_PARAMS.iter() {
-            out.push_back(*p);
+#[contractimpl]
+impl PriceOracle {
+    /// Initialize the contract with an authorized reviewer/admin.
+    pub fn initialize(env: Env, admin: Address) {
+        if env.storage().instance().has(&DataKey::Admin) {
+            panic!("already initialized");
         }
-        out
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::NextAppealId, &0u64);
     }
 
-    /// Returns `asset`'s tier together with the parameters it resolves to after
-    /// the documented per-asset overrides (#487). `None` when unassigned.
-    pub fn get_resolved_asset_tier(env: Env, asset: Address) -> Option<ResolvedTier> {
-        let key = DataKey::AssetPolicy(asset.clone());
-        let over: PolicyOverride = env
+    /// Admin sets (or updates) the hard reward budget and partial-payout policy.
+    ///
+    /// The budget cannot be lowered below what has already been paid out, so
+    /// the cap can never be retroactively violated. `allow_partial` defaults
+    /// to false; it must be set explicitly to permit clamped payouts.
+    pub fn set_reward_budget(
+        env: Env,
+        admin: Address,
+        total_budget: i128,
+        allow_partial: bool,
+    ) {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+        if total_budget < 0 {
+            panic!("budget must be non-negative");
+        }
+
+        let paid_out = Self::paid_out(&env);
+        if total_budget < paid_out {
+            panic!("budget below already paid out");
+        }
+
+        let budget = RewardBudget {
+            total_budget,
+            paid_out,
+            allow_partial,
+        };
+        env.storage().instance().set(&DataKey::Budget, &budget);
+    }
+
+    /// Pay out a reward against the budget.
+    ///
+    /// Returns the amount actually paid. If the requested amount fits within
+    /// the remaining allocation it is paid in full. If it would exceed the
+    /// remaining allocation the payout fails atomically (no partial payout)
+    /// unless the admin explicitly enabled `allow_partial`, in which case the
+    /// payout is clamped to the remaining allocation.
+    pub fn pay_reward(env: Env, admin: Address, amount: i128) -> i128 {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+        if amount < 0 {
+            panic!("amount must be non-negative");
+        }
+
+        let mut budget: RewardBudget = env
             .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or(PolicyOverride {
-                method: None,
-                min_sources: None,
-                freshness_secs: None,
-                max_deviation_bps: None,
+            .instance()
+            .get(&DataKey::Budget)
+            .expect("budget not set");
+
+        let remaining = budget.total_budget - budget.paid_out;
+
+        let payout = if amount <= remaining {
+            amount
+        } else if budget.allow_partial {
+            remaining
+        } else {
+            panic!("insufficient reward budget");
+        };
+
+        budget.paid_out += payout;
+        env.storage().instance().set(&DataKey::Budget, &budget);
+
+        payout
+    }
+
+    /// Fetch the current reward budget state.
+    pub fn get_reward_budget(env: Env) -> RewardBudget {
+        env.storage()
+            .instance()
+            .get(&DataKey::Budget)
+            .expect("budget not set")
+    }
+
+    /// Remaining allocation available for future payouts.
+    pub fn remaining_budget(env: Env) -> i128 {
+        let budget: RewardBudget = env
+            .storage()
+            .instance()
+            .get(&DataKey::Budget)
+            .expect("budget not set");
+        budget.total_budget - budget.paid_out
+    }
+
+    /// Admin sets the incentive policy for a given version.
+    ///
+    /// The version must be strictly greater than the currently stored
+    /// version (or this is the first policy). Setting a policy does not
+    /// touch accrued balances; use `migrate_policy` to transition.
+    pub fn set_incentive_policy(
+        env: Env,
+        admin: Address,
+        version: u32,
+        reward_rate_bps: u32,
+        min_contribution: i128,
+    ) {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+        if min_contribution < 0 {
+            panic!("min_contribution must be non-negative");
+        }
+        if let Some(current) = Self::policy(&env) {
+            if version <= current.version {
+                panic!("version must increase");
+            }
+        }
+        let policy = IncentivePolicy {
+            version,
+            reward_rate_bps,
+            min_contribution,
+        };
+        env.storage().instance().set(&DataKey::Policy, &policy);
+    }
+
+    /// Fetch the current incentive policy.
+    pub fn get_incentive_policy(env: Env) -> IncentivePolicy {
+        Self::policy(&env).expect("policy not set")
+    }
+
+    /// Record an accrued reward for a participant under the current policy
+    /// version. Accrued amounts are stored verbatim and never recomputed.
+    pub fn accrue_reward(env: Env, admin: Address, participant: Address, amount: i128) {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+        if amount < 0 {
+            panic!("amount must be non-negative");
+        }
+        let policy = Self::policy(&env).expect("policy not set");
+        let mut accruals = Self::accruals(&env);
+        accruals.push_back(Accrual {
+            participant,
+            amount,
+            version: policy.version,
+        });
+        env.storage().instance().set(&DataKey::Accruals, &accruals);
+    }
+
+    /// Total accrued reward balance across all participants.
+    pub fn total_accrued(env: Env) -> i128 {
+        let accruals = Self::accruals(&env);
+        let mut total: i128 = 0;
+        for a in accruals.iter() {
+            total += a.amount;
+        }
+        total
+    }
+
+    /// Migrate the incentive policy from its current version to `to_version`.
+    ///
+    /// Migration semantics:
+    /// - Accrued balances are preserved verbatim (grandfathered). No rounding
+    ///   is applied to accrued amounts, so total accrued balance is conserved
+    ///   exactly across the migration.
+    /// - Each accrual is re-tagged with `to_version` so future accounting
+    ///   reflects the active policy, while the amount is unchanged.
+    /// - The policy parameters for `to_version` must already be set via
+    ///   `set_incentive_policy`.
+    ///
+    /// Returns a `MigrationResult` documenting the transition for audit.
+    pub fn migrate_policy(env: Env, admin: Address, to_version: u32) -> MigrationResult {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+
+        let current = Self::policy(&env).expect("policy not set");
+        if to_version <= current.version {
+            panic!("target version must increase");
+        }
+
+        let accruals = Self::accruals(&env);
+        let mut total: i128 = 0;
+        let mut migrated: Vec<Accrual> = Vec::new(&env);
+        for a in accruals.iter() {
+            total += a.amount;
+            migrated.push_back(Accrual {
+                participant: a.participant,
+                amount: a.amount,
+                version: to_version,
             });
-        risk_tier::resolve(&env, &asset, &over)
+        }
+        let participants = migrated.len();
+
+        env.storage().instance().set(&DataKey::Accruals, &migrated);
+
+        let new_policy = IncentivePolicy {
+            version: to_version,
+            reward_rate_bps: current.reward_rate_bps,
+            min_contribution: current.min_contribution,
+        };
+        env.storage().instance().set(&DataKey::Policy, &new_policy);
+
+        MigrationResult {
+            from_version: current.version,
+            to_version,
+            total_accrued: total,
+            participants,
+        }
     }
 
-    // ── #488 Cross-asset sanity lattice ─────────────────────────────────────
-
-    /// Declares a consistency relation for `asset` (#488).
-    ///
-    /// Admin only. Validated on write: the tolerance must be in
-    /// `1..=10000` bps, a peg ratio must have a positive numerator and
-    /// non-zero denominator, and a triangular cross must name three distinct
-    /// registered assets.
-    pub fn add_sanity_relation(env: Env, asset: Address, relation: types::SanityRelation) {
-        sanity_lattice::add_relation(&env, asset, relation);
+    fn require_admin(env: &Env, caller: &Address) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        if caller != &admin {
+            panic!("unauthorized reviewer");
+        }
     }
 
-    /// Removes the relation between `asset` and `peer` of the given kind (#488).
-    pub fn remove_sanity_relation(
-        env: Env,
-        asset: Address,
-        peer: Address,
-        kind: types::SanityRelationKind,
-    ) {
-        sanity_lattice::remove_relation(&env, asset, peer, kind);
+    fn paid_out(env: &Env) -> i128 {
+        match env.storage().instance().get::<DataKey, RewardBudget>(&DataKey::Budget) {
+            Some(budget) => budget.paid_out,
+            None => 0,
+        }
     }
 
-    /// Returns the relations declared on `asset` (#488).
-    pub fn get_sanity_relations(
-        env: Env,
-        asset: Address,
-    ) -> soroban_sdk::Vec<types::SanityRelation> {
-        sanity_lattice::get_relations(&env, &asset)
+    fn policy(env: &Env) -> Option<IncentivePolicy> {
+        env.storage().instance().get(&DataKey::Policy)
     }
 
-    /// Suspends every relation touching `asset` until `until_ledger` (#488).
-    ///
-    /// For a declared de-peg. The asset itself keeps aggregating, publishing
-    /// and serving — only the family checks stop applying.
-    pub fn declare_depeg(env: Env, asset: Address, until_ledger: u32, reason: String) {
-        sanity_lattice::declare_depeg(&env, asset, until_ledger, reason);
+    fn accruals(env: &Env) -> Vec<Accrual> {
+        match env.storage().instance().get::<DataKey, Vec<Accrual>>(&DataKey::Accruals) {
+            Some(accruals) => accruals,
+            None => Vec::new(env),
+        }
     }
 
-    /// Lifts a de-peg suspension immediately (#488).
-    pub fn clear_depeg(env: Env, asset: Address) {
-        sanity_lattice::clear_depeg(&env, asset);
-    }
-
-    /// Returns `true` while a de-peg suspension is in force for `asset` (#488).
-    pub fn is_depeg_suspended(env: Env, asset: Address) -> bool {
-        sanity_lattice::is_suspended(&env, &asset)
-    }
-
-    /// Returns the last sanity-check outcome for `asset` (#488).
-    pub fn get_sanity_status(env: Env, asset: Address) -> Option<types::SanityStatus> {
-        sanity_lattice::get_status(&env, &asset)
-    }
-
-    /// Returns the assets reachable from `asset` through declared relations
-    /// (#488). Terminates on cycles: a visited asset is never expanded twice
-    /// and the total is capped.
-    pub fn get_sanity_peers(env: Env, asset: Address) -> soroban_sdk::Vec<Address> {
-        sanity_lattice::reachable(&env, &asset)
-    }
-
-    // ── #489 Freshness-aware quorum ─────────────────────────────────────────
-
-    /// Sets the global default freshness window, in seconds (#489). `0` clears
-    /// it. Windows above `604800` are rejected.
-    pub fn set_default_freshness_window(env: Env, secs: u64) {
-        freshness_quorum::set_default_window(&env, secs);
-    }
-
-    /// Returns the global default freshness window, in seconds (#489).
-    pub fn get_default_freshness_window(env: Env) -> u64 {
-        freshness_quorum::default_window(&env)
-    }
-
-    /// Sets an asset's own freshness window, in seconds (#489). `0` clears the
-    /// override, returning the asset to the tier/global default.
-    pub fn set_asset_freshness_window(env: Env, asset: Address, secs: u64) {
-        freshness_quorum::set_asset_window(&env, asset, secs);
-    }
-
-    /// Returns the freshness-filter outcome of the most recent aggregation of
-    /// `asset` (#489): how many submissions were fresh, how many were excluded
-    /// as stale, the quorum they were measured against and which window
-    /// applied. `None` until the asset has been through a gated pass.
-    pub fn get_freshness_status(env: Env, asset: Address) -> Option<types::FreshnessStatus> {
-        freshness_quorum::get_status(&env, &asset)
-    }
-
-    // ── #490 Per-source accuracy scorecards ─────────────────────────────────
-
-    /// Enables collection of per-source accuracy scorecards (#490). Off by
-    /// default, so the publication path pays nothing until asked.
-    pub fn enable_scorecards(env: Env) {
-        scorecards::enable(&env);
-    }
-
-    /// Disables scorecard collection (#490). Retained scorecards stay queryable.
-    pub fn disable_scorecards(env: Env) {
-        scorecards::disable(&env);
-    }
-
-    /// Sets the scorecard windows, cold-start threshold, hit tolerance and
-    /// per-sample outlier cap (#490). Bounds-checked on write.
-    pub fn set_scorecard_config(env: Env, config: types::ScorecardConfig) {
-        scorecards::set_config(&env, config);
-    }
-
-    /// Returns the active scorecard configuration (#490).
-    pub fn get_scorecard_config(env: Env) -> types::ScorecardConfig {
-        scorecards::config(&env)
-    }
-
-    /// Returns `source`'s rolling accuracy scorecard (#490). A source with too
-    /// little history is reported `cold_start` rather than scored as poor.
-    pub fn get_source_scorecard(env: Env, source: Address) -> types::SourceScorecard {
-        scorecards::get_scorecard(&env, &source)
-    }
-
-    /// Returns the 0–10000 (bps) accuracy score for `source`, with the
-    /// documented floor applied (#490). `0` while the source is cold-start.
-    pub fn get_source_accuracy_score(env: Env, source: Address) -> u32 {
-        scorecards::accuracy_score(&env, &source)
-    }
-
-    /// Returns the retained winsorized samples backing `source`'s windows,
-    /// oldest first (#490). These are exactly the values carried by
-    /// `SourceScorecardUpdatedEvent`, so the windows are reconstructible
-    /// off-chain from the event stream.
-    pub fn get_source_scorecard_samples(env: Env, source: Address) -> soroban_sdk::Vec<u32> {
-        scorecards::samples(&env, &source)
-    }
-
-    // ── TWAP observation cardinality ─────────────────────────────────────────
-
-    /// Sets the minimum distinct observations a TWAP window needs (1..=64). Admin only.
-    pub fn set_twap_min_cardinality(env: Env, min_cardinality: u32) {
-        prices::set_twap_min_cardinality(&env, min_cardinality);
-    }
-
-    /// Returns the TWAP cardinality floor.
-    pub fn get_twap_min_cardinality(env: Env) -> u32 {
-        prices::get_twap_min_cardinality(&env)
-    }
-
-    /// TWAP together with its observation cardinality.
-    ///
-    /// # Errors
-    /// * [`ErrorCode::TwapInsufficientObservations`] — fewer observations than the floor.
-    pub fn get_twap_ex(
-        env: Env,
-        asset: Address,
-        window_ledgers: u32,
-        method: TwapMethod,
-    ) -> Option<TwapResult> {
-        prices::get_twap_ex(&env, Asset::Stellar(asset), window_ledgers, method)
-    }
-
-    // =========================================================================
-    // #246 — Configurable history storage tier
-    // =========================================================================
-
-    /// Admin endpoint selecting the storage tier an asset's price history uses.
-    ///
-    /// Upgrades (temporary → persistent) apply immediately. Downgrades
-    /// (persistent → temporary) are destructive — they let an asset's evidence
-    /// trail expire — so they require multi-party approval plus a timelock; see
-    /// `propose_storage_tier_downgrade`, `approve_storage_tier_downgrade` and
-    /// `execute_storage_tier_downgrade`.
-    ///
-    /// # Errors
-    /// * [`ErrorCode::AssetNotRegistered`] — `asset` is not registered.
-    /// * [`ErrorCode::NotAuthorized`] — caller is not the admin.
-    /// * [`ErrorCode::StorageTierDowngradeNotReady`] — a downgrade was attempted
-    ///   without a matured, fully approved request.
-    pub fn set_asset_storage_tier(env: Env, asset: Address, tier: HistoryStorageTier) {
-        storage_tier::set_asset_storage_tier(&env, asset, tier);
-    }
-
-    /// Returns the storage tier an asset's price history is written to.
-    pub fn get_asset_storage_tier(env: Env, asset: Address) -> HistoryStorageTier {
-        storage_tier::get_asset_storage_tier(&env, &asset)
-    }
-
-    /// Returns the discoverable retention guarantee for an asset's history tier.
-    pub fn get_storage_tier_info(env: Env, asset: Address) -> StorageTierInfo {
-        storage_tier::get_storage_tier_info(&env, &asset)
-    }
-
-    /// Proposes a persistent → temporary downgrade and returns the ledger at
-    /// which the approval window closes. Admin only.
-    pub fn propose_storage_tier_downgrade(env: Env, asset: Address) -> u32 {
-        storage_tier::propose_storage_tier_downgrade(&env, asset)
-    }
-
-    /// Records a second party's approval of a pending downgrade. `approver` must
-    /// authorize the call and must not be the proposing admin.
-    pub fn approve_storage_tier_downgrade(env: Env, asset: Address, approver: Address) {
-        storage_tier::approve_storage_tier_downgrade(&env, asset, approver);
-    }
-
-    /// Executes a fully approved, matured downgrade request. Admin only.
-    pub fn execute_storage_tier_downgrade(env: Env, asset: Address) {
-        storage_tier::execute_storage_tier_downgrade(&env, asset);
-    }
-
-    /// Copies an asset's retained history entries into `to_tier`, returning the
-    /// number of entries migrated. Admin only.
-    pub fn migrate_history_to_tier(env: Env, asset: Address, to_tier: HistoryStorageTier) -> u32 {
-        storage_tier::migrate_history_to_tier(&env, asset, to_tier)
-    }
-
-    /// Reads one history entry strictly from the asset's configured tier.
-    ///
-    /// Returns `None` when the entry is absent — including when a temporary-tier
-    /// entry has expired — and never falls back to the other tier, so a missing
-    /// entry can never be mistaken for a differently-stored one.
-    pub fn get_tiered_historical_price(
-        env: Env,
-        asset: Address,
-        ledger: u32,
-    ) -> Option<PriceHistoryEntry> {
-        storage_tier::read_history_entry(&env, &asset, ledger)
-    }
-
-    /// Reports whether a history entry exists in the asset's configured tier.
-    pub fn has_tiered_historical_price(env: Env, asset: Address, ledger: u32) -> bool {
-        storage_tier::read_history_entry(&env, &asset, ledger).is_some()
-    }
-
-    // =========================================================================
-    // #289 — Subscription auto-renewal
-    // =========================================================================
-
-    /// Grants a bounded standing authorization for the contract to renew a
-    /// subscription by pulling tokens. `consumer` must authorize the call.
-    pub fn enable_auto_renewal(
-        env: Env,
-        consumer: Address,
-        token: Address,
-        plan_duration: u32,
-        max_amount_per_period: i128,
-        periods_authorized: u32,
-    ) {
-        auto_renewal::enable_auto_renewal(
-            &env,
-            consumer,
-            token,
-            plan_duration,
-            max_amount_per_period,
-            periods_authorized,
-        );
-    }
-
-    /// Revokes a standing auto-renewal authorization. `consumer` must authorize.
-    pub fn disable_auto_renewal(env: Env, consumer: Address) {
-        auto_renewal::disable_auto_renewal(&env, consumer);
-    }
-
-    /// Issues a single-use authorization to renew one specific period.
-    /// `consumer` must authorize the call.
-    pub fn authorize_renewal(env: Env, consumer: Address, period_id: u64, nonce: u64) {
-        auto_renewal::authorize_renewal(&env, consumer, period_id, nonce);
-    }
-
-    /// Attempts one renewal on a consumer's behalf. Callable by any keeper and
-    /// never panics, so a failed renewal cannot lock a consumer out.
-    pub fn try_auto_renew(env: Env, consumer: Address) -> RenewalAttempt {
-        auto_renewal::try_auto_renew(&env, consumer)
-    }
-
-    /// Returns a consumer's standing auto-renewal authorization, if any.
-    pub fn get_auto_renewal_record(env: Env, consumer: Address) -> Option<AutoRenewRecord> {
-        auto_renewal::get_auto_renewal_record(&env, &consumer)
-    }
-
-    /// Returns the single-use renewal authorization for a period, if any.
-    pub fn get_renewal_authorization(
-        env: Env,
-        consumer: Address,
-        period_id: u64,
-    ) -> Option<RenewalAuthorization> {
-        auto_renewal::get_renewal_authorization(&env, &consumer, period_id)
-    }
-
-    // =========================================================================
-    // #397 — Multi-round price confirmation
-    // =========================================================================
-
-    /// Configures multi-round price confirmation for an asset. Admin only.
-    ///
-    /// `required_rounds == 1` restores the default single-round behaviour.
-    pub fn set_round_config(env: Env, asset: Address, config: RoundConfig) {
-        consensus_rounds::set_round_config(&env, asset, config);
-    }
-
-    /// Returns an asset's round configuration (default: single-round, disabled).
-    pub fn get_round_config(env: Env, asset: Address) -> RoundConfig {
-        consensus_rounds::get_round_config(&env, &asset)
-    }
-
-    /// Opens a new confirmation round and returns its identity. Any keeper may
-    /// call this; the round identity is derived from contract state, not input.
-    pub fn start_round(env: Env, asset: Address) -> u32 {
-        consensus_rounds::start_round(&env, asset)
-    }
-
-    /// Submits a source's observation into the asset's current round.
-    /// `source` must authorize the call.
-    pub fn submit_round_vote(
-        env: Env,
-        source: Address,
-        asset: Address,
-        round: u32,
-        price: i128,
-        timestamp: u64,
-    ) {
-        consensus_rounds::submit_round_vote(&env, source, asset, round, price, timestamp);
-    }
-
-    /// Finalizes a price once `required_rounds` consecutive, independent rounds
-    /// have agreed. Panics with [`ErrorCode::NoData`] when they have not.
-    pub fn finalize_confirmation(env: Env, asset: Address) -> ConfirmedPrice {
-        consensus_rounds::finalize_confirmation(&env, asset)
-    }
-
-    /// Returns the most recently confirmed price for an asset, if any.
-    pub fn get_confirmed_price(env: Env, asset: Address) -> Option<ConfirmedPrice> {
-        consensus_rounds::get_confirmed_price(&env, &asset)
-    }
-
-    /// Returns the current round's status, including its liveness deadline.
-    pub fn get_round_status(env: Env, asset: Address) -> RoundStatus {
-        consensus_rounds::get_round_status(&env, &asset)
-    }
-
-    /// Abandons a stalled round so a fresh one can start, returning the new round.
-    pub fn abandon_stalled_round(env: Env, asset: Address) -> u32 {
-        consensus_rounds::abandon_stalled_round(&env, asset)
-    }
-
-    /// Returns the tally recorded for a round that reached quorum, if any.
-    pub fn get_round_tally(env: Env, asset: Address, round: u32) -> Option<RoundTally> {
-        consensus_rounds::get_round_tally(&env, &asset, round)
-    }
-
-    /// Durably records an equivocation penalty against a source for one round.
-    ///
-    /// Permissionless — the evidence is on-chain, so anyone may report. This is
-    /// a separate call from `submit_round_vote` because the conflicting
-    /// submission panics, and a panicking call rolls back its own writes.
-    pub fn report_equivocation(env: Env, source: Address, asset: Address, round: u32) {
-        consensus_rounds::report_equivocation(&env, source, asset, round);
-    }
-
-    /// Returns a source's lifetime equivocation count for an asset.
-    pub fn get_equivocation_count(env: Env, source: Address, asset: Address) -> u32 {
-        consensus_rounds::get_equivocation_count(&env, &source, &asset)
-    }
-
-    /// Returns whether a source is barred from a round for equivocation.
-    pub fn is_barred_from_round(env: Env, source: Address, asset: Address, round: u32) -> bool {
-        consensus_rounds::is_barred_from_round(&env, &source, &asset, round)
-    }
-
-    // =========================================================================
-    // #478 — On-chain derived price feeds
-    // =========================================================================
-
-    /// Pins a canonical base price for an asset, used by the derivation engine
-    /// in preference to the live aggregate. Admin only.
-    pub fn set_derived_feed_base(env: Env, asset: Address, price: i128, timestamp: u64) {
-        derived_feeds::set_derived_feed_base(&env, asset, price, timestamp);
-    }
-
-    /// Returns the inverse feed `1 / asset`.
-    pub fn get_inverse_feed(env: Env, asset: Address) -> DerivedFeed {
-        derived_feeds::get_inverse_feed(&env, asset)
-    }
-
-    /// Returns the pairwise ratio feed `base / quote`.
-    pub fn get_ratio_feed(env: Env, base: Address, quote: Address) -> DerivedFeed {
-        derived_feeds::get_ratio_feed(&env, base, quote)
-    }
-
-    /// Returns the triangulated cross-rate `(base / pivot) * (pivot / quote)`.
-    pub fn get_triangulated_feed(
-        env: Env,
-        base: Address,
-        pivot: Address,
-        quote: Address,
-    ) -> DerivedFeed {
-        derived_feeds::get_triangulated_feed(&env, base, pivot, quote)
-    }
-
-    /// Computes a derived feed of any kind, with full provenance.
-    pub fn compute_derived_feed(
-        env: Env,
-        kind: DerivedFeedKind,
-        base: Address,
-        quote: Address,
-        pivot: Option<Address>,
-    ) -> DerivedFeed {
-        derived_feeds::compute_derived_feed(&env, kind, base, quote, pivot)
-    }
-
-    // ── #491–#494: data-quality endpoints restored after the merge of PR
-    // #571 dropped them from this impl block. ───────────────────────────────
-
-    /// Returns the pairwise disagreement index recorded by the most recent
-    /// aggregate of `asset` (#494).
-    pub fn get_disagreement_index(env: Env, asset: Address) -> Option<types::DisagreementIndex> {
-        disagreement::get_index(&env, &asset)
-    }
-
-    /// Returns latency percentiles for a (source, asset) pair over the
-    /// rolling window of stored samples (#492).
-    ///
-    /// Every duration is in **ledgers**; `seconds_per_ledger` in the report
-    /// gives the nominal conversion. `never_counted` counts submissions that
-    /// were replaced before any aggregate counted them, and `window`
-    /// carries the raw samples so the percentiles can be recomputed.
-    pub fn get_latency_report(env: Env, source: Address, asset: Address) -> types::LatencyReport {
-        latency::get_report(&env, &source, &asset)
-    }
-
-    /// Returns the raw rolling latency samples for a (source, asset) pair,
-    /// oldest first (#492).
-    pub fn get_latency_samples(
+    /// A source disputes a measured contribution or payout for a given epoch.
+    /// Returns the new appeal id.
+    pub fn file_appeal(
         env: Env,
         source: Address,
         asset: Address,
