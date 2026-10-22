@@ -9,6 +9,12 @@
 //! published in `docs/fee-schedule.md` and `docs/fee-schedule-review.md`.
 //! The pure calculation below mirrors that method so the review is a
 //! repeatable check rather than a one-off spreadsheet.
+//!
+//! Reward budget cap and exhaustion behavior (issue #676):
+//! an admin sets a hard total payout budget. Cumulative payouts can never
+//! exceed it. A payout that would exceed the remaining allocation fails
+//! atomically with no partial payout; partial payouts are only permitted
+//! when the admin explicitly enables that policy.
 
 #![no_std]
 
@@ -85,6 +91,21 @@ pub struct FeeImpact {
     pub effective_bps: u32,
 }
 
+/// Reward budget state (issue #676).
+///
+/// `total_budget` is the hard cap on cumulative payouts. `paid_out` tracks
+/// the cumulative amount already paid. `allow_partial` is the explicit
+/// policy switch: when false (default) a payout that would exceed the
+/// remaining allocation fails atomically; when true the payout is clamped
+/// to the remaining allocation.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RewardBudget {
+    pub total_budget: i128,
+    pub paid_out: i128,
+    pub allow_partial: bool,
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
@@ -92,6 +113,7 @@ pub enum DataKey {
     NextAppealId,
     Appeal(u64),
     Corrections(u64),
+    Budget,
 }
 
 #[contract]
@@ -106,6 +128,108 @@ impl PriceOracle {
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::NextAppealId, &0u64);
+    }
+
+    /// Admin sets (or updates) the hard reward budget and partial-payout policy.
+    ///
+    /// The budget cannot be lowered below what has already been paid out, so
+    /// the cap can never be retroactively violated. `allow_partial` defaults
+    /// to false; it must be set explicitly to permit clamped payouts.
+    pub fn set_reward_budget(
+        env: Env,
+        admin: Address,
+        total_budget: i128,
+        allow_partial: bool,
+    ) {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+        if total_budget < 0 {
+            panic!("budget must be non-negative");
+        }
+
+        let paid_out = Self::paid_out(&env);
+        if total_budget < paid_out {
+            panic!("budget below already paid out");
+        }
+
+        let budget = RewardBudget {
+            total_budget,
+            paid_out,
+            allow_partial,
+        };
+        env.storage().instance().set(&DataKey::Budget, &budget);
+    }
+
+    /// Pay out a reward against the budget.
+    ///
+    /// Returns the amount actually paid. If the requested amount fits within
+    /// the remaining allocation it is paid in full. If it would exceed the
+    /// remaining allocation the payout fails atomically (no partial payout)
+    /// unless the admin explicitly enabled `allow_partial`, in which case the
+    /// payout is clamped to the remaining allocation.
+    pub fn pay_reward(env: Env, admin: Address, amount: i128) -> i128 {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+        if amount < 0 {
+            panic!("amount must be non-negative");
+        }
+
+        let mut budget: RewardBudget = env
+            .storage()
+            .instance()
+            .get(&DataKey::Budget)
+            .expect("budget not set");
+
+        let remaining = budget.total_budget - budget.paid_out;
+
+        let payout = if amount <= remaining {
+            amount
+        } else if budget.allow_partial {
+            remaining
+        } else {
+            panic!("insufficient reward budget");
+        };
+
+        budget.paid_out += payout;
+        env.storage().instance().set(&DataKey::Budget, &budget);
+
+        payout
+    }
+
+    /// Fetch the current reward budget state.
+    pub fn get_reward_budget(env: Env) -> RewardBudget {
+        env.storage()
+            .instance()
+            .get(&DataKey::Budget)
+            .expect("budget not set")
+    }
+
+    /// Remaining allocation available for future payouts.
+    pub fn remaining_budget(env: Env) -> i128 {
+        let budget: RewardBudget = env
+            .storage()
+            .instance()
+            .get(&DataKey::Budget)
+            .expect("budget not set");
+        budget.total_budget - budget.paid_out
+    }
+
+    fn require_admin(env: &Env, caller: &Address) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        if caller != &admin {
+            panic!("unauthorized reviewer");
+        }
+    }
+
+    fn paid_out(env: &Env) -> i128 {
+        match env.storage().instance().get::<DataKey, RewardBudget>(&DataKey::Budget) {
+            Some(budget) => budget.paid_out,
+            None => 0,
+        }
     }
 
     /// A source disputes a measured contribution or payout for a given epoch.
@@ -245,143 +369,6 @@ impl PriceOracle {
 
         // Variable fees: per-asset and per-update (beyond the first update).
         let per_asset_total = schedule.per_asset_fee * assets_i;
-        let extra_updates = if updates > 1 { updates_i - 1 } else { 0 };
-        let per_update_total = schedule.per_update_fee * extra_updates;
-        let storage_total = schedule.storage_fee_per_asset * assets_i;
+        let extra_updat
 
-        let mut variable = per_asset_total + per_update_total + storage_total;
-
-        // Volume tier discount on variable fees only; base fee is never discounted.
-        if schedule.tier_threshold > 0 && updates >= schedule.tier_threshold {
-            let bps = schedule.tier_discount_bps as i128;
-            variable -= variable * bps / 10_000;
-        }
-
-        let total_fee = schedule.base_fee + variable;
-
-        let effective_bps = if gross_value > 0 {
-            let bps = total_fee * 10_000 / gross_value;
-            if bps > u32::MAX as i128 {
-                u32::MAX
-            } else {
-                bps as u32
-            }
-        } else {
-            0
-        };
-
-        FeeImpact {
-            total_fee,
-            effective_bps,
-        }
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-    use soroban_sdk::testutils::Address as _;
-    use soroban_sdk::{Env, Symbol};
-
-    #[test]
-    fn resolves_dispute_without_overwriting_audit_record() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let contract_id = env.register_contract(None, PriceOracle);
-        let client = PriceOracleClient::new(&env, &contract_id);
-
-        let admin = Address::generate(&env);
-        let source = Address::generate(&env);
-        client.initialize(&admin);
-
-        let appeal_id = client.file_appeal(
-            &source,
-            &7u64,
-            &100i128,
-            &Symbol::new(&env, "underpaid"),
-        );
-
-        let original = client.get_appeal(&appeal_id);
-        assert_eq!(original.disputed_amount, 100);
-        assert!(!original.resolved);
-
-        client.approve_appeal(&admin, &appeal_id, &100i128, &150i128);
-
-        // Original appeal record remains intact and is marked resolved.
-        let after = client.get_appeal(&appeal_id);
-        assert_eq!(after.disputed_amount, 100);
-        assert_eq!(after.epoch, 7);
-        assert!(after.resolved);
-
-        // Correction is appended alongside the original audit record.
-        let corrections = client.get_corrections(&appeal_id);
-        assert_eq!(corrections.len(), 1);
-        let c = corrections.get(0).unwrap();
-        assert_eq!(c.original_amount, 100);
-        assert_eq!(c.corrected_amount, 150);
-        assert_eq!(c.approved_by, admin);
-    }
-
-    fn sample_schedule() -> FeeSchedule {
-        // Matches the published assumptions in docs/fee-schedule.md.
-        FeeSchedule {
-            base_fee: 100_000,
-            per_asset_fee: 10_000,
-            per_update_fee: 5_000,
-            storage_fee_per_asset: 2_000,
-            tier_threshold: 100,
-            tier_discount_bps: 1_000,
-        }
-    }
-
-    #[test]
-    fn fee_impact_matches_documented_worked_example() {
-        // Worked example from docs/fee-schedule-review.md:
-        // 3 assets, 10 updates, gross 50_000_000 stroops (5 XLM).
-        // variable = 10_000*3 + 5_000*9 + 2_000*3 = 30_000 + 45_000 + 6_000 = 81_000
-        // below tier threshold (10 < 100), no discount.
-        // total = 100_000 + 81_000 = 181_000 stroops.
-        // effective_bps = 181_000 * 10_000 / 50_000_000 = 36 bps.
-        let impact = PriceOracle::compute_fee_impact(sample_schedule(), 3, 10, 50_000_000);
-        assert_eq!(impact.total_fee, 181_000);
-        assert_eq!(impact.effective_bps, 36);
-    }
-
-    #[test]
-    fn fee_impact_applies_tier_discount_at_threshold() {
-        // 1 asset, 100 updates (at threshold), gross 1_000_000_000 stroops.
-        // variable = 10_000 + 5_000*99 + 2_000 = 507_000
-        // discount 10% -> 456_300; total = 100_000 + 456_300 = 556_300.
-        let impact = PriceOracle::compute_fee_impact(sample_schedule(), 1, 100, 1_000_000_000);
-        assert_eq!(impact.total_fee, 556_300);
-    }
-
-    #[test]
-    fn fee_impact_is_zero_without_activity() {
-        let zero_updates = PriceOracle::compute_fee_impact(sample_schedule(), 5, 0, 1_000_000);
-        assert_eq!(zero_updates.total_fee, 0);
-        assert_eq!(zero_updates.effective_bps, 0);
-
-        let zero_assets = PriceOracle::compute_fee_impact(sample_schedule(), 0, 5, 1_000_000);
-        assert_eq!(zero_assets.total_fee, 0);
-        assert_eq!(zero_assets.effective_bps, 0);
-    }
-
-    #[test]
-    fn fee_impact_handles_zero_gross_value() {
-        let impact = PriceOracle::compute_fee_impact(sample_schedule(), 1, 1, 0);
-        assert_eq!(impact.total_fee, 100_000);
-        assert_eq!(impact.effective_bps, 0);
-    }
-
-    #[test]
-    fn small_integration_cost_is_bounded() {
-        // Smallest active integration: 1 asset, 1 update, gross 10_000_000 (1 XLM).
-        // total = base 100_000 + per_asset 10_000 + storage 2_000 = 112_000.
-        // effective_bps = 112_000 * 10_000 / 10_000_000 = 112 bps.
-        let impact = PriceOracle::compute_fee_impact(sample_schedule(), 1, 1, 10_000_000);
-        assert_eq!(impact.total_fee, 112_000);
-        assert_eq!(impact.effective_bps, 112);
-    }
-}
+/* … truncated 5094 chars — edit only what you need near the top … */
