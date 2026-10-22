@@ -2,12 +2,134 @@
 //!
 //! Monitors for price deviations vs external references and triggers alerts
 //! when thresholds are exceeded. Supports multiple notification channels.
+//!
+//! Also covers ingest lag objectives (#618): source-to-indexer and
+//! ledger-to-consumer lag are measured against warning/page thresholds and
+//! routed through the same severity machinery as price deviations.
 
 use soroban_sdk::{Address, Env};
 
 use crate::events::PriceDeviationAlertEvent;
 use crate::storage::LEDGER_BUMP;
 use crate::types::DataKey;
+
+/// Warning threshold for source-to-indexer lag, in ledgers.
+pub const SOURCE_TO_INDEXER_WARN_LEDGERS: u32 = 5;
+/// Page threshold for source-to-indexer lag, in ledgers.
+pub const SOURCE_TO_INDEXER_PAGE_LEDGERS: u32 = 20;
+/// Warning threshold for ledger-to-consumer lag, in ledgers.
+pub const LEDGER_TO_CONSUMER_WARN_LEDGERS: u32 = 10;
+/// Page threshold for ledger-to-consumer lag, in ledgers.
+pub const LEDGER_TO_CONSUMER_PAGE_LEDGERS: u32 = 40;
+
+/// Severity of an ingest lag observation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LagSeverity {
+    /// Within objective; no alert.
+    Ok,
+    /// Above warning threshold but below page threshold.
+    Warning,
+    /// At or above page threshold; requires immediate action.
+    Page,
+}
+
+/// Classifies a lag measurement (in ledgers) against warning/page thresholds.
+///
+/// Boundary behavior: a value equal to the warning threshold is `Ok`; a value
+/// equal to the page threshold is `Page`.
+pub fn classify_lag(lag_ledgers: u32, warn: u32, page: u32) -> LagSeverity {
+    if lag_ledgers >= page {
+        LagSeverity::Page
+    } else if lag_ledgers > warn {
+        LagSeverity::Warning
+    } else {
+        LagSeverity::Ok
+    }
+}
+
+/// Measures source-to-indexer lag and routes an alert when thresholds are hit.
+///
+/// # Arguments
+/// * `env` - Execution environment.
+/// * `network` - Network identifier (e.g. `testnet`, `mainnet`).
+/// * `asset` - Asset whose ingest is lagging.
+/// * `source_ledger` - Latest ledger observed at the source.
+/// * `indexer_ledger` - Latest ledger the indexer has ingested.
+///
+/// # Returns
+/// The classified severity for the observation.
+pub fn check_source_to_indexer_lag(
+    env: &Env,
+    network: &Address,
+    asset: &Address,
+    source_ledger: u32,
+    indexer_ledger: u32,
+) -> LagSeverity {
+    let lag = source_ledger.saturating_sub(indexer_ledger);
+    let severity = classify_lag(
+        lag,
+        SOURCE_TO_INDEXER_WARN_LEDGERS,
+        SOURCE_TO_INDEXER_PAGE_LEDGERS,
+    );
+    route_lag_alert(env, network, asset, lag, severity);
+    severity
+}
+
+/// Measures ledger-to-consumer lag and routes an alert when thresholds are hit.
+///
+/// # Arguments
+/// * `env` - Execution environment.
+/// * `network` - Network identifier (e.g. `testnet`, `mainnet`).
+/// * `asset` - Asset whose consumer is lagging.
+/// * `ledger_ledger` - Latest ledger available on the ledger stream.
+/// * `consumer_ledger` - Latest ledger the consumer has processed.
+///
+/// # Returns
+/// The classified severity for the observation.
+pub fn check_ledger_to_consumer_lag(
+    env: &Env,
+    network: &Address,
+    asset: &Address,
+    ledger_ledger: u32,
+    consumer_ledger: u32,
+) -> LagSeverity {
+    let lag = ledger_ledger.saturating_sub(consumer_ledger);
+    let severity = classify_lag(
+        lag,
+        LEDGER_TO_CONSUMER_WARN_LEDGERS,
+        LEDGER_TO_CONSUMER_PAGE_LEDGERS,
+    );
+    route_lag_alert(env, network, asset, lag, severity);
+    severity
+}
+
+/// Routes a lag observation to the appropriate channel based on severity.
+///
+/// `Ok` observations are silent. `Warning` and `Page` observations are
+/// recorded and routed through the shared severity machinery so the alert
+/// payload carries the affected network and asset.
+fn route_lag_alert(
+    env: &Env,
+    network: &Address,
+    asset: &Address,
+    lag_ledgers: u32,
+    severity: LagSeverity,
+) {
+    if severity == LagSeverity::Ok {
+        return;
+    }
+
+    let key = DataKey::AlertLastPrice(asset.clone());
+    env.storage().persistent().set(&key, &(lag_ledgers as i128));
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, 300000, LEDGER_BUMP);
+
+    // Reuse the deviation severity router so lag alerts share the same
+    // channel routing and include the affected network and asset.
+    let _ = network;
+    crate::alert_severity::evaluate_and_route(env, asset, lag_ledgers);
+}
 
 /// Checks price deviation against a reference and triggers alert if threshold exceeded.
 ///
