@@ -399,6 +399,12 @@ mod wasm_binary_size_tests;
 #[cfg(test)]
 mod issues_491_492_493_494_tests;
 
+// #689 — Upgrade authorization is bound to the approved release artifact: a
+// substituted WASM hash is refused before any mutation. See
+// docs/blue-green-upgrade.md.
+#[cfg(test)]
+mod upgrade_artifact_binding_tests;
+
 pub use types::{
     AdminOpLimit, AdminOperationType, AggregatePrice, AggregationMethod, AggregationRound,
     AlertSubscription, AmmPool, AmmWeightConfig, AnomalyExplanation, AnomalyRule, Asset,
