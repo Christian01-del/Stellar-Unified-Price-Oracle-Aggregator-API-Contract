@@ -263,81 +263,52 @@ contracts/price-oracle/
     └── test.rs      # Test suite (65 tests)
 ```
 
-## Tech Stack
+### Assumptions
 
-| Layer | Technology |
-|-------|-----------|
-| Contract | Rust, Soroban SDK v26 |
-| Target | `wasm32v1-none` (WebAssembly) |
-| Aggregation | On-chain median (Rust) |
-| Testing | `#[cfg(test)]` with `soroban-sdk/testutils` |
+All figures are monthly, denominated in USD, and reviewed whenever the
+underlying inputs change materially.
 
-## Error Codes
+| Input | Value | Notes |
+| --- | --- | --- |
+| Committed funding (treasury balance) | $60,000 | Funds already committed and available. |
+| Baseline operational spend | $2,000 / month | Hosting, RPC/indexer access, monitoring, on-call stipend. |
+| Low-usage operational spend | $1,400 / month | Reduced infrastructure tier; fewer provider submissions. |
+| High-incident operational spend | $4,500 / month | Incident response, extra redundancy, surge support. |
+| Funding-review threshold | 6 months of runway | Below this, a funding review is triggered. |
 
-| Code | Name | Description |
-|------|------|-------------|
-| 0 | `NotAuthorized` | Caller is not the admin or required signer |
-| 1 | `AlreadyInitialized` | Contract already initialized |
-| 2 | `AssetNotRegistered` | Asset not found |
-| 3 | `AssetAlreadyRegistered` | Asset already registered |
-| 4 | `SourceAlreadyExists` | Source already registered |
-| 5 | `SourceNotFound` | Source not found |
-| 6 | `InsufficientSources` | Not enough sources for aggregation |
-| 7 | `InvalidPrice` | Price is zero or negative |
-| 8 | `NoData` | No price data available (or gap with interpolation disabled) |
-| 9 | `InvalidTimestamp` | Submitted timestamp too far in the future |
-| 10 | `InvalidConfiguration` | Configuration parameter out of valid range |
-| 11 | `DescriptionTooLong` | Description exceeds 256 characters |
-| 12 | `ContractPaused` | Contract is paused; operations blocked |
-| 13 | `TimelockNotReady` | Timelock delay has not elapsed |
-| 14 | `OperationNotFound` | No pending timelock operation with that ID |
-| 15 | `PriceBelowMinimum` | Price is below the asset's configured minimum |
+Operational spend covers infrastructure, provider incentives, monitoring, and
+incident response. It excludes one-off protocol development costs.
 
-See [`docs/error-codes.md`](docs/error-codes.md) for the full registry with causes and resolutions.
+### Runway per scenario
 
-## Documentation
+Runway is `committed funding / monthly operational spend`.
 
-| Document | Description |
-|---|---|
-| [Architecture](docs/ARCHITECTURE.md) | System design, data flow, module structure |
-| [Hackathon Bounty Track](docs/hackathon-bounty-track.md) | Hackathon bounty track definition, curated project ideas, judging rubric, and reward tiers |
-| [Deployment Record](docs/deployment.md) | Contract addresses, initialization parameters, admin addresses, deployment checklist |
-| [Security Audit Checklist](docs/security-audit-checklist.md) | Pre-audit review items: access control, input validation, arithmetic safety, storage safety, upgrade mechanism, event integrity, known patterns |
-| [Attack-Regression Corpus](docs/security/attack-regression-corpus.md) | Every historical adversarial scenario pinned as a test, by attack class, with a mutation check proving the corpus has teeth (#511) |
-| [Formal Verification](docs/security/formal-verification.md) | Bounded proofs for the aggregation math, the stated bounded domain, and the proven-vs-sampled split (#512) |
-| [State-Machine Model](docs/security/state-machine-model.md) | Independently written model of the aggregate lifecycle, driven by shrinking random traces (#513) |
-| [Coverage-Guided Fuzzing](docs/security/fuzzing.md) | Fuzz targets, the committed minimized corpus, and the CI crash and size gates (#514) |
-| [Monitoring Dashboard](docs/monitoring/README.md) | Grafana dashboard setup and metrics reference |
-| [Quickstart Templates](examples/README.md) | CI-tested web (SEP-40), Python bot and indexer templates |
-| [Interface Package](docs/interface-versioning.md) | Versioned `@stellar-unified-price-oracle/interface` npm package, semver rules, deprecation policy |
-| [Error Registry](docs/errors/REGISTRY.md) | Every error code with meaning, cause and remediation ([JSON](docs/errors/registry.json)) |
-| [Migration Guides](docs/migrations/README.md) | Per-version guides for breaking changes and deprecation windows |
-| [Integration Case Studies](docs/case-studies.md) | Lending, DEX and payments integrations with threat models, worked exploits and countermeasures |
-| [Seam Invariant Catalogue](docs/seam-invariants.md) | Cross-module invariants and the regression tests that enforce them |
-| [SLA](docs/SLA.md) | Service levels and the machine-enforceable clause map checked by `services/sla_monitor` |
-| [Runbook](docs/runbook.md) | Every paging alert mapped to meaning, first check, mitigation, escalation, resolution, owner and review cadence (#527) |
-| [Incident Management](docs/incident-management/README.md) | Blameless postmortem process, template, index and tracked action items (#528) |
-| [Backup and Restore](docs/backup-restore.md) | Off-chain state inventory, encrypted backups, point-in-time restore and reconciliation (#529) |
-| [Capacity Planning](docs/capacity-planning.md) | Ingest, storage and ledger-budget model with headroom targets and load shedding (#530) |
-| [Price Revision Metrics](docs/price-revision-metrics.md) | Correction-rate metric per asset and per source, cause separation, volume normalization and sustained-increase alerting (#499) |
-| [Static Analysis](docs/static-analysis.md) | SAST rules, dependency-advisory gate, owned+expiring allowlist and the re-baseline process (#500) |
-| [Reproducible Builds](docs/reproducible-builds.md) | Exact dependency pins, canonical containerized build environment, two-build digest check (#501) |
-| [Secret Scanning](docs/secret-scanning.md) | Pre-commit and CI secret scanning, history scan, allowlist process and the rotation playbook (#502) |
+| Scenario | Monthly spend | Runway | Status vs. 6-month threshold |
+| --- | --- | --- | --- |
+| Baseline | $2,000 | 30.0 months | Healthy |
+| Low-usage | $1,400 | ~42.9 months | Healthy |
+| High-incident | $4,500 | ~13.3 months | Healthy, but monitor |
 
-## Documentation
+### Funding-review threshold
 
-- [Hackathon Bounty Track](docs/hackathon-bounty-track.md) — reusable hackathon track definition, curated ideas mapped to open issues, judging rubric, and reward tiers (#407)
-- [Price Submission Bot Design](docs/price-submission-bot.md) — off-chain bot architecture for automated price submissions
-- [Signed CEX/Aggregator Adapters](docs/signed-price-adapters.md) — CoinGecko/Binance/Coinbase adapters with failover, staleness handling, and signed submission (#216)
-- [Disaster Recovery Plan](docs/disaster-recovery.md) — failure scenario playbooks and recovery procedures
-- [Architecture](docs/ARCHITECTURE.md) — contract design and data flow
-- [Monitoring](docs/monitoring/README.md) — Grafana dashboard and alerting setup
+A funding review is triggered when projected runway falls **below 6 months**
+under the scenario currently in effect. At the baseline spend of $2,000/month,
+that corresponds to a treasury balance below **$12,000**. The review covers
+replenishment options, spend reduction, and whether the high-incident scenario
+has become the steady state.
 
-## License
+### Boundary and failure/recovery paths
 
-MIT
+- **Boundary:** runway exactly at the 6-month threshold does not trigger a
+  review; only strictly below it does.
+- **Failure:** if the high-incident scenario persists, spend rises to
+  $4,500/month and runway shrinks accordingly; sustained high-incident spend is
+  treated as a funding-review trigger even while nominal runway is above the
+  threshold.
+- **Recovery:** once incident spend returns to baseline, runway is recomputed
+  from the restored spend and the review condition is re-evaluated.
 
-## Service Level Agreement
+### Repeatable check
 
 See [docs/SLA.md](docs/SLA.md) for price freshness guarantees, uptime commitments, deviation thresholds, incident response times, and compensation terms.
 

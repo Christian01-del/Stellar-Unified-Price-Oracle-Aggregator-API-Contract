@@ -494,3 +494,53 @@ pub fn collect_incident_bundle(
 
     bundle
 }
+
+/// Deterministic per-entry reward weight derived from retained event data.
+///
+/// The weight is a pure function of the entry's payload size (a quality metric
+/// captured at append time), so replaying the same retained events yields the
+/// same weight. Integer-only: no rounding is required.
+pub fn reward_weight(entry: &AuditEntry) -> u64 {
+    1 + (entry.data.len() as u64)
+}
+
+/// Compute the reproducible source reward for a single admin.
+///
+/// Iterates the retained audit entries in `[from_id, to_id]` (inclusive) and
+/// sums `reward_weight` for entries whose `admin` matches `admin`. Entries for
+/// other admins are skipped. Returns 0 when no entries match (empty/zero case).
+///
+/// Because the calculation is integer-only and depends solely on retained
+/// entries, an independent replay over the same events reproduces the exact
+/// allocation.
+pub fn compute_source_reward(env: &Env, admin: &Address, from_id: u32, to_id: u32) -> u64 {
+    let entry_count: u32 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::AuditEntryCount)
+        .unwrap_or(0);
+
+    let start_id = if from_id == 0 { 1 } else { from_id };
+    let end_id = if to_id == 0 || to_id > entry_count {
+        entry_count
+    } else {
+        to_id
+    };
+
+    let mut total: u64 = 0;
+    let mut i = start_id;
+    while i <= end_id {
+        if let Some(entry) = env
+            .storage()
+            .persistent()
+            .get::<_, AuditEntry>(&DataKey::AuditEntry(i))
+        {
+            if &entry.admin == admin {
+                total = total.saturating_add(reward_weight(&entry));
+            }
+        }
+        i += 1;
+    }
+
+    total
+}
