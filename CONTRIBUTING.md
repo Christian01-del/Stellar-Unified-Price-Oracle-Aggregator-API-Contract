@@ -61,6 +61,84 @@ For proposals related to contract upgrades, parameter changes, source additions/
 
 Submit completed proposals as a GitHub issue or pull request for community review before any on-chain action is taken.
 
+## Mainnet Release Freeze and Exception Procedure
+
+Mainnet releases are gated by a code/configuration freeze so that the artifact that is
+reviewed is the artifact that ships. This procedure applies to every mainnet release.
+
+### Freeze Window
+
+- **Start:** the freeze begins when the release candidate tag (`vX.Y.Z-rc.N`) is cut and the
+  release PR is opened against `main`.
+- **End:** the freeze ends only after the release is deployed to mainnet and the release record
+  (below) is merged. If the release is abandoned, the freeze ends when the release PR is closed.
+- **What is frozen:** `main` (no direct pushes), the contract source under `contracts/`, the
+  build toolchain pins (`rust-toolchain.toml`, `Cargo.lock`), and all mainnet configuration
+  (network passphrase, contract IDs, admin/upgrade keys, source registry, and oracle parameters).
+- **During the freeze:** only the release PR may merge. Non-release PRs are held until the
+  freeze ends. CI must be green on the exact commit being released.
+
+### Permitted Emergency Exceptions
+
+An exception may be granted only for a defect that blocks or breaks the release and cannot wait
+for the next cycle. Permitted categories:
+
+1. **Release-blocking bug fix** — a minimal, targeted fix with a regression test.
+2. **Security fix** — a patch for a vulnerability or invariant violation.
+3. **Configuration correction** — a fix to an incorrect mainnet parameter or address.
+4. **Build/toolchain fix** — a change required to reproduce the release artifact.
+
+Not permitted: new features, refactors, dependency upgrades unrelated to the fix, or any change
+without test coverage. Each exception must be minimal, scoped to the defect, and accompanied by a
+reason and an approval recorded in the release record.
+
+### Accountable Approvers
+
+| Decision | Approver(s) |
+|---|---|
+| Declaring the freeze / cutting the RC | Release Manager (a Maintainer) |
+| Approving an emergency exception | One Core Maintainer **and** one additional Maintainer (not the author) |
+| Approving an exception touching upgrade/admin paths or keys | Two Core Maintainers |
+| Lifting the freeze | Release Manager, after the release record is merged |
+
+Approvals are recorded as review approvals on the release PR and summarized in the release record.
+
+### Release Record
+
+Every mainnet release includes a release record committed under `docs/releases/` (for example
+`docs/releases/vX.Y.Z.md`) using this template:
+
+```markdown
+# Release vX.Y.Z
+
+- Release Manager:
+- RC tag / commit:
+- Freeze start:
+- Freeze end:
+- CI run (green on released commit):
+
+## Freeze Decision
+
+- [ ] Freeze declared at RC cut
+- [ ] No non-release changes merged during freeze
+
+## Exceptions
+
+For each exception, record: category, description, reason, linked PR, and approvers.
+
+| Category | Description | Reason | PR | Approved by |
+|---|---|---|---|---|
+| _(none)_ | | | | |
+
+## Sign-off
+
+- Release Manager:
+- Core Maintainer:
+```
+
+A release is not complete until this record shows the freeze decision and any exception with its
+reason and approval. No secrets or production credentials are ever committed in the record.
+
 ## Contributor Ladder
 
 The contributor ladder is a security control as much as a recognition scheme. Access escalates
