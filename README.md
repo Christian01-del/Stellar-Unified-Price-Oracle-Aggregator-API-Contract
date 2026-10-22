@@ -294,3 +294,6 @@ See [docs/SLA.md](docs/SLA.md) for price freshness guarantees, uptime commitment
 
 <!-- handsoff-issue-636 -->
 - #636: [Integrations] Consumer integration certification harness
+
+<!-- handsoff-issue-638 -->
+- #638: [Integrations] Cross-network consumer configuration isolation
