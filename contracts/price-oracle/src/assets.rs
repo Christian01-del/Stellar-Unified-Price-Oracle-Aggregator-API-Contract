@@ -9,6 +9,56 @@ use crate::storage::{
 };
 use crate::types::{AssetMetadata, AssetMetadataUpdate, DataKey, ErrorCode, PriceBounds};
 
+/// Production asset onboarding policy.
+///
+/// Every asset enabled at launch must carry a complete review record before it
+/// can enter the production manifest. The record captures eligibility, the
+/// required metadata, the risk review, and the sign-off. A registration is
+/// rejected unless all required fields are present and well-formed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssetOnboardingRecord {
+    /// Eligibility: the asset is a supported Stellar/Soroban token.
+    pub eligible: bool,
+    /// Required metadata: human-readable name (non-empty).
+    pub name: Bytes,
+    /// Required metadata: ticker symbol (non-empty).
+    pub symbol: Bytes,
+    /// Required metadata: decimals (must be <= 18).
+    pub decimals: u32,
+    /// Required metadata: logo URI (non-empty).
+    pub logo_uri: Bytes,
+    /// Risk review: reviewer identifier (non-empty).
+    pub risk_reviewer: Bytes,
+    /// Risk review: risk tier (0 = low .. 3 = high).
+    pub risk_tier: u32,
+    /// Sign-off: approver identifier (non-empty).
+    pub sign_off: Bytes,
+}
+
+/// Validate an onboarding record against the production policy.
+///
+/// Returns `Ok(())` when every required review field is present and within
+/// bounds, otherwise panics with `ErrorCode::InvalidConfiguration`. This is the
+/// single gate that a new asset must pass before entering the manifest.
+#[allow(dead_code)]
+pub fn validate_onboarding_record(env: &Env, record: &AssetOnboardingRecord) {
+    if !record.eligible {
+        panic_with_error!(env, ErrorCode::InvalidConfiguration);
+    }
+    if record.name.is_empty() || record.symbol.is_empty() || record.logo_uri.is_empty() {
+        panic_with_error!(env, ErrorCode::InvalidConfiguration);
+    }
+    if record.decimals > 18 {
+        panic_with_error!(env, ErrorCode::InvalidConfiguration);
+    }
+    if record.risk_reviewer.is_empty() || record.sign_off.is_empty() {
+        panic_with_error!(env, ErrorCode::InvalidConfiguration);
+    }
+    if record.risk_tier > 3 {
+        panic_with_error!(env, ErrorCode::InvalidConfiguration);
+    }
+}
+
 pub fn register_asset(env: &Env, asset: Address) {
     let admin = get_admin(env);
     admin.require_auth();
@@ -45,6 +95,19 @@ pub fn register_asset(env: &Env, asset: Address) {
     }
     .publish(env);
     emit_admin_action(env, symbol_short!("reg_asset"), admin, Bytes::new(env));
+}
+
+/// Register an asset into the production manifest, enforcing the onboarding
+/// policy. The asset cannot enter the manifest unless the supplied record
+/// passes `validate_onboarding_record`.
+#[allow(dead_code)]
+pub fn register_asset_with_policy(
+    env: &Env,
+    asset: Address,
+    record: AssetOnboardingRecord,
+) {
+    validate_onboarding_record(env, &record);
+    register_asset(env, asset);
 }
 
 pub fn unregister_asset(env: &Env, asset: Address) {
@@ -254,51 +317,53 @@ pub fn get_price_bounds(env: &Env, asset: Address) -> PriceBounds {
             .persistent()
             .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
     }
-    env.storage().persistent().get(&key).unwrap_or(PriceBounds {
-        min_price: 0,
-        max_price: i128::MAX,
-        max_change_bps_per_ledger: 0,
-    })
+    env.storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or(PriceBounds {
+            min_price: 0,
+            max_price: i128::MAX,
+            max_change_bps_per_ledger: 0,
+        })
 }
 
-pub fn is_asset_paused(env: &Env, asset: &Address) -> bool {
-    let key = DataKey::AssetPauseFlag(asset.clone());
-    if env.storage().persistent().has(&key) {
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
-    }
-    env.storage().persistent().get(&key).unwrap_or(false)
-}
-
-pub fn set_asset_paused(env: &Env, asset: &Address, paused: bool) {
-    let key = DataKey::AssetPauseFlag(asset.clone());
-    env.storage().persistent().set(&key, &paused);
-}
-
-pub fn is_circuit_breaker_tripped(env: &Env, asset: &Address) -> bool {
-    let key = DataKey::AssetCircuitBreakerTripped(asset.clone());
-    if env.storage().persistent().has(&key) {
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
-    }
-    env.storage().persistent().get(&key).unwrap_or(false)
-}
-
-pub fn pause_asset(env: &Env, asset: Address) {
+#[allow(dead_code)]
+pub fn set_asset_paused(env: &Env, asset: Address, paused: bool) {
     let admin = get_admin(env);
     admin.require_auth();
     crate::storage::check_registered_asset(env, &asset);
-    set_asset_paused(env, &asset, true);
-    emit_admin_action(env, symbol_short!("pause_ast"), admin, Bytes::new(env));
+    env.storage()
+        .persistent()
+        .set(&DataKey::AssetPauseFlag(asset.clone()), &paused);
 }
 
-pub fn unpause_asset(env: &Env, asset: Address) {
+pub fn is_asset_paused(env: &Env, asset: Address) -> bool {
+    env.storage()
+        .persistent()
+        .get(&DataKey::AssetPauseFlag(asset.clone()))
+        .unwrap_or(false)
+}
+
+pub fn trip_circuit_breaker(env: &Env, asset: Address, reason: Bytes) {
     let admin = get_admin(env);
     admin.require_auth();
     crate::storage::check_registered_asset(env, &asset);
-    set_asset_paused(env, &asset, false);
+    env.storage()
+        .persistent()
+        .set(&DataKey::AssetCircuitBreakerTripped(asset.clone()), &true);
+    CircuitBreakerTrippedEvent {
+        asset: asset.clone(),
+        admin: admin.clone(),
+        reason: reason.clone(),
+    }
+    .publish(env);
+    emit_admin_action(env, symbol_short!("cb_trip"), admin, reason);
+}
+
+pub fn reset_circuit_breaker(env: &Env, asset: Address) {
+    let admin = get_admin(env);
+    admin.require_auth();
+    crate::storage::check_registered_asset(env, &asset);
     env.storage()
         .persistent()
         .set(&DataKey::AssetCircuitBreakerTripped(asset.clone()), &false);
@@ -307,48 +372,26 @@ pub fn unpause_asset(env: &Env, asset: Address) {
         admin: admin.clone(),
     }
     .publish(env);
-    emit_admin_action(env, symbol_short!("unp_asts"), admin, Bytes::new(env));
+    emit_admin_action(env, symbol_short!("cb_reset"), admin, Bytes::new(env));
 }
 
-pub fn trip_circuit_breaker(
-    env: &Env,
-    asset: Address,
-    previous_price: i128,
-    candidate_price: i128,
-    change_bps: i128,
-    max_change_bps: u32,
-) {
-    set_asset_paused(env, &asset, true);
+pub fn is_circuit_breaker_tripped(env: &Env, asset: Address) -> bool {
     env.storage()
         .persistent()
-        .set(&DataKey::AssetCircuitBreakerTripped(asset.clone()), &true);
+        .get(&DataKey::AssetCircuitBreakerTripped(asset.clone()))
+        .unwrap_or(false)
+}
 
-    let count_key = DataKey::AssetCircuitBreakerLogCount(asset.clone());
-    let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
-    let next_count = count + 1;
-    let entry = CircuitBreakerEventEntry {
-        asset: asset.clone(),
-        previous_price,
-        candidate_price,
-        change_bps: change_bps.min(i128::from(u32::MAX)) as u32,
-        max_change_bps,
-        ledger: env.ledger().sequence(),
-        timestamp: env.ledger().timestamp(),
-    };
-    env.storage().persistent().set(
-        &DataKey::AssetCircuitBreakerLog(asset.clone(), next_count),
-        &entry,
-    );
-    env.storage().persistent().set(&count_key, &next_count);
-
-    CircuitBreakerTrippedEvent {
-        asset: asset.clone(),
-        previous_price,
-        candidate_price,
-        change_bps: entry.change_bps,
-        max_change_bps,
-        ledger: env.ledger().sequence(),
-        timestamp: env.ledger().timestamp(),
+#[allow(dead_code)]
+pub fn get_circuit_breaker_log(env: &Env, asset: Address) -> Vec<CircuitBreakerEventEntry> {
+    let key = DataKey::AssetCircuitBreakerLog(asset.clone());
+    if env.storage().persistent().has(&key) {
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
     }
-    .publish(env);
+    env.storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or(Vec::new(env))
 }

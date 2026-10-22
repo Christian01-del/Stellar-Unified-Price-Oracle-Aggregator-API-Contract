@@ -1,1 +1,32 @@
 # One asset contract id per line, compared by the canary pipeline.
+#
+# Production asset onboarding policy (issue #605)
+# -------------------------------------------------
+# Every asset enabled at launch MUST satisfy all of the following before its
+# contract id may be listed here. The canary pipeline treats this file as the
+# production manifest, so an entry that does not meet the policy is a launch
+# blocker.
+#
+# Eligibility
+#   - Asset is issued on Stellar mainnet and has a verifiable issuer account.
+#   - Soroban asset contract is deployed and its wasm hash is pinned/reviewed.
+#   - Asset is supported by the oracle price feed(s) it will be quoted against.
+#
+# Required metadata (all fields mandatory)
+#   - contract_id      : the asset contract id listed below
+#   - symbol           : canonical ticker
+#   - issuer           : Stellar account (G...) or native marker
+#   - decimals         : integer precision used by the contract
+#   - price_feed       : oracle feed id backing the asset
+#   - risk_review      : link/id of the completed risk review
+#   - signoff          : approver identity + date of launch sign-off
+#
+# Risk review
+#   - Liquidity, volatility, and oracle-manipulation risk assessed and recorded.
+#   - Failure/recovery path (feed outage, stale price) documented for the asset.
+#
+# Sign-off
+#   - Risk review and sign-off recorded before the asset is added below.
+#   - An asset without every required field above MUST NOT enter this manifest.
+#
+# Format: one asset contract id per line, compared by the canary pipeline.
