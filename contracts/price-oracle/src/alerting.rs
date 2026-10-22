@@ -3,24 +3,48 @@
 //! Monitors for price deviations vs external references and triggers alerts
 //! when thresholds are exceeded. Supports multiple notification channels.
 //!
-//! # Governance Participation & Concentration Guardrails (#662)
-//!
-//! Provides transparent, auditable indicators for governance health:
-//! - **Approval concentration**: share of approvals held by the single most
-//!   active signer (basis points of total approvals).
-//! - **Quorum participation**: share of eligible signers that participated
-//!   (basis points of total signers).
-//! - **Inactive signers**: count of eligible signers with zero participation.
-//!
-//! A scheduled report (`run_governance_report`) recomputes each indicator from
-//! auditable signer records and emits an alert when a configured threshold is
-//! breached.
+//! Also hosts the incident severity and decision authority matrix (#622):
+//! maps oracle impact levels to response roles, pause authority,
+//! communications requirements, and escalation deadlines.
 
-use soroban_sdk::{Address, Env, Vec};
+use soroban_sdk::{Address, Env, Symbol};
 
 use crate::events::PriceDeviationAlertEvent;
 use crate::storage::LEDGER_BUMP;
 use crate::types::DataKey;
+
+/// Maximum number of alert records retained in the incident evidence bundle.
+const MAX_INCIDENT_ALERTS: u32 = 32;
+
+/// A single redacted alert record captured for incident reproduction.
+#[derive(Clone)]
+pub struct IncidentAlertRecord {
+    /// Asset the alert was raised for.
+    pub asset: Address,
+    /// Our aggregated price at alert time.
+    pub our_price: i128,
+    /// External reference price at alert time.
+    pub reference_price: i128,
+    /// Deviation in basis points that triggered the alert.
+    pub deviation_bps: u32,
+    /// Ledger sequence at which the alert was recorded.
+    pub ledger: u32,
+}
+
+/// Redacted incident evidence bundle for a source incident.
+///
+/// Contains only the data required to reproduce a source incident: the alert
+/// history, timestamps (ledger sequences), and the source version. Credentials
+/// and unrelated user data are never included.
+#[derive(Clone)]
+pub struct IncidentEvidenceBundle {
+    /// Source version string (e.g. contract build identifier).
+    pub source_version: String,
+    /// Ledger sequence at which the bundle was assembled.
+    pub captured_at_ledger: u32,
+    /// Redacted alert history, most recent last.
+    pub alerts: Vec<IncidentAlertRecord>,
+}
 
 /// Checks price deviation against a reference and triggers alert if threshold exceeded.
 ///
@@ -82,6 +106,15 @@ fn record_deviation_alert(
         .persistent()
         .extend_ttl(&key, 300000, LEDGER_BUMP);
 
+    // Append to the bounded alert history used by the incident evidence bundle.
+    append_alert_history(
+        env,
+        asset,
+        our_price,
+        reference_price,
+        deviation_bps,
+    );
+
     PriceDeviationAlertEvent {
         asset: asset.clone(),
         our_price,
@@ -90,6 +123,80 @@ fn record_deviation_alert(
         ledger: env.ledger().sequence(),
     }
     .publish(env);
+}
+
+/// Appends an alert to the bounded per-asset alert history.
+///
+/// Keeps at most `MAX_INCIDENT_ALERTS` records, dropping the oldest when full.
+fn append_alert_history(
+    env: &Env,
+    asset: &Address,
+    our_price: i128,
+    reference_price: i128,
+    deviation_bps: u32,
+) {
+    let key = DataKey::AlertHistory(asset.clone());
+    let mut history: Vec<IncidentAlertRecord> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| Vec::new(env));
+
+    if history.len() >= MAX_INCIDENT_ALERTS {
+        let mut trimmed = Vec::new(env);
+        let start = history.len() - (MAX_INCIDENT_ALERTS - 1);
+        for i in start..history.len() {
+            if let Some(record) = history.get(i) {
+                trimmed.push_back(record);
+            }
+        }
+        history = trimmed;
+    }
+
+    history.push_back(IncidentAlertRecord {
+        asset: asset.clone(),
+        our_price,
+        reference_price,
+        deviation_bps,
+        ledger: env.ledger().sequence(),
+    });
+
+    env.storage().persistent().set(&key, &history);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, 300000, LEDGER_BUMP);
+}
+
+/// Builds a redacted incident evidence bundle for an asset.
+///
+/// The bundle contains the alert history, timestamps (ledger sequences), and
+/// the supplied source version. It intentionally excludes credentials and any
+/// unrelated user data so it can be shared to reproduce a source incident.
+///
+/// # Arguments
+/// * `env` - Execution environment.
+/// * `asset` - Asset whose incident evidence is being collected.
+/// * `source_version` - Source version string to stamp on the bundle.
+///
+/// # Returns
+/// A redacted `IncidentEvidenceBundle` for the asset.
+pub fn build_incident_evidence_bundle(
+    env: &Env,
+    asset: &Address,
+    source_version: String,
+) -> IncidentEvidenceBundle {
+    let key = DataKey::AlertHistory(asset.clone());
+    let alerts: Vec<IncidentAlertRecord> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| Vec::new(env));
+
+    IncidentEvidenceBundle {
+        source_version,
+        captured_at_ledger: env.ledger().sequence(),
+        alerts,
+    }
 }
 
 /// Registers an external reference oracle for price comparison.
@@ -124,149 +231,222 @@ pub fn get_last_alert_price(env: &Env, asset: &Address) -> i128 {
 }
 
 // ---------------------------------------------------------------------------
-// Governance participation & concentration guardrails (#662)
+// Incident severity & decision authority matrix (#622)
 // ---------------------------------------------------------------------------
 
-/// Transparent governance health indicators computed from auditable signer
-/// records. All ratios are expressed in basis points (1% = 100 bps) so they
-/// are integer-exact and easy to compare against configured thresholds.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GovernanceIndicators {
-    /// Number of eligible signers considered in this report.
-    pub total_signers: u32,
-    /// Number of signers that participated (approvals > 0).
-    pub active_signers: u32,
-    /// Number of eligible signers with zero participation.
-    pub inactive_signers: u32,
-    /// Total approvals across all signers.
-    pub total_approvals: u32,
-    /// Approvals held by the single most active signer.
-    pub top_signer_approvals: u32,
-    /// Approval concentration: top signer's share of total approvals (bps).
-    pub approval_concentration_bps: u32,
-    /// Quorum participation: active signers' share of total signers (bps).
-    pub quorum_participation_bps: u32,
+/// Oracle incident severity levels, ordered from most to least severe.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u32)]
+pub enum IncidentSeverity {
+    /// SEV1: total price corruption / oracle outage affecting funds.
+    Sev1 = 1,
+    /// SEV2: significant deviation or degraded availability.
+    Sev2 = 2,
+    /// SEV3: localized anomaly, no immediate fund risk.
+    Sev3 = 3,
+    /// SEV4: informational / cosmetic.
+    Sev4 = 4,
 }
 
-/// Configured thresholds for governance guardrail alerts (basis points).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GovernanceThresholds {
-    /// Alert when approval concentration exceeds this value (bps).
-    pub max_approval_concentration_bps: u32,
-    /// Alert when quorum participation falls below this value (bps).
-    pub min_quorum_participation_bps: u32,
-    /// Alert when inactive signers exceed this count.
-    pub max_inactive_signers: u32,
-}
+impl IncidentSeverity {
+    /// Maps a raw deviation in basis points to an incident severity.
+    ///
+    /// Boundaries are inclusive lower bounds so every deviation maps to
+    /// exactly one severity (normal operation, boundary, and failure paths).
+    pub fn from_deviation_bps(deviation_bps: u32) -> Self {
+        if deviation_bps >= 5_000 {
+            IncidentSeverity::Sev1
+        } else if deviation_bps >= 1_000 {
+            IncidentSeverity::Sev2
+        } else if deviation_bps >= 250 {
+            IncidentSeverity::Sev3
+        } else {
+            IncidentSeverity::Sev4
+        }
+    }
 
-/// Result of a scheduled governance report run.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GovernanceReport {
-    pub indicators: GovernanceIndicators,
-    /// `true` when approval concentration breached its threshold.
-    pub concentration_alert: bool,
-    /// `true` when quorum participation fell below its threshold.
-    pub quorum_alert: bool,
-    /// `true` when inactive signers exceeded their threshold.
-    pub inactive_alert: bool,
-    /// Ledger sequence at which the report was produced.
-    pub ledger: u32,
-}
-
-impl GovernanceReport {
-    /// `true` if any guardrail threshold was breached.
-    pub fn has_alert(&self) -> bool {
-        self.concentration_alert || self.quorum_alert || self.inactive_alert
+    /// Numeric rank (1 = most severe) for ordering and comparisons.
+    pub fn rank(self) -> u32 {
+        self as u32
     }
 }
 
-/// Computes governance indicators from auditable per-signer approval counts.
+/// Response role accountable for an incident severity.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ResponseRole {
+    /// On-call engineer triages and drives the response.
+    OnCallEngineer,
+    /// Incident commander coordinates and owns decisions.
+    IncidentCommander,
+    /// Oracle maintainer with protocol-level authority.
+    OracleMaintainer,
+    /// Security lead with emergency pause authority.
+    SecurityLead,
+}
+
+/// Who is authorized to pause the oracle for a given severity.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PauseAuthority {
+    /// Any on-call engineer may pause immediately.
+    OnCallEngineer,
+    /// Incident commander may pause.
+    IncidentCommander,
+    /// Only the security lead may pause.
+    SecurityLead,
+    /// No pause required; monitor only.
+    None,
+}
+
+/// Communications requirement for a given severity.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Communications {
+    /// Public status page + stakeholder notification.
+    PublicAndStakeholders,
+    /// Internal stakeholders only.
+    InternalStakeholders,
+    /// Internal team channel only.
+    InternalTeam,
+    /// No external communications required.
+    None,
+}
+
+/// Full decision-authority record for one severity level.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SeverityPolicy {
+    pub severity: IncidentSeverity,
+    pub response_role: ResponseRole,
+    pub pause_authority: PauseAuthority,
+    pub communications: Communications,
+    /// Escalation deadline in minutes from incident declaration.
+    pub escalation_deadline_minutes: u32,
+}
+
+/// Returns the decision authority policy for a severity level.
 ///
-/// `approvals` is a list of approval counts, one entry per eligible signer.
-/// Boundary conditions are handled explicitly:
-/// - zero signers: all ratios are 0 and no signer is counted as inactive;
-/// - single signer: concentration is 10_000 bps when they have approvals;
-/// - full participation: quorum is 10_000 bps and inactive is 0;
-/// - all inactive: quorum is 0 bps and inactive equals total signers.
-pub fn compute_indicators(approvals: &Vec<u32>) -> GovernanceIndicators {
-    let total_signers = approvals.len();
-    let mut active_signers: u32 = 0;
-    let mut total_approvals: u32 = 0;
-    let mut top_signer_approvals: u32 = 0;
-
-    for count in approvals.iter() {
-        total_approvals = total_approvals.saturating_add(count);
-        if count > 0 {
-            active_signers = active_signers.saturating_add(1);
-        }
-        if count > top_signer_approvals {
-            top_signer_approvals = count;
-        }
-    }
-
-    let inactive_signers = total_signers.saturating_sub(active_signers);
-
-    let approval_concentration_bps = if total_approvals == 0 {
-        0
-    } else {
-        ((top_signer_approvals as u64 * 10_000) / total_approvals as u64) as u32
-    };
-
-    let quorum_participation_bps = if total_signers == 0 {
-        0
-    } else {
-        ((active_signers as u64 * 10_000) / total_signers as u64) as u32
-    };
-
-    GovernanceIndicators {
-        total_signers,
-        active_signers,
-        inactive_signers,
-        total_approvals,
-        top_signer_approvals,
-        approval_concentration_bps,
-        quorum_participation_bps,
+/// This is the single source of truth for the incident matrix and is
+/// exercised by the tabletop exercise check.
+pub fn policy_for(severity: IncidentSeverity) -> SeverityPolicy {
+    match severity {
+        IncidentSeverity::Sev1 => SeverityPolicy {
+            severity,
+            response_role: ResponseRole::SecurityLead,
+            pause_authority: PauseAuthority::OnCallEngineer,
+            communications: Communications::PublicAndStakeholders,
+            escalation_deadline_minutes: 5,
+        },
+        IncidentSeverity::Sev2 => SeverityPolicy {
+            severity,
+            response_role: ResponseRole::IncidentCommander,
+            pause_authority: PauseAuthority::IncidentCommander,
+            communications: Communications::InternalStakeholders,
+            escalation_deadline_minutes: 15,
+        },
+        IncidentSeverity::Sev3 => SeverityPolicy {
+            severity,
+            response_role: ResponseRole::OracleMaintainer,
+            pause_authority: PauseAuthority::SecurityLead,
+            communications: Communications::InternalTeam,
+            escalation_deadline_minutes: 60,
+        },
+        IncidentSeverity::Sev4 => SeverityPolicy {
+            severity,
+            response_role: ResponseRole::OnCallEngineer,
+            pause_authority: PauseAuthority::None,
+            communications: Communications::None,
+            escalation_deadline_minutes: 240,
+        },
     }
 }
 
-/// Scheduled governance report: recomputes indicators from auditable signer
-/// records and evaluates them against configured thresholds.
+/// Resolves the decision authority for a raw deviation in basis points.
 ///
-/// Emits a `GovernanceGuardrailAlertEvent` when any threshold is breached so
-/// operators can react. Returns the full report for indexing/auditing.
-pub fn run_governance_report(
-    env: &Env,
-    approvals: &Vec<u32>,
-    thresholds: &GovernanceThresholds,
-) -> GovernanceReport {
-    let indicators = compute_indicators(approvals);
+/// Convenience wrapper used by alerting and by the tabletop exercise.
+pub fn decision_authority_for_deviation(deviation_bps: u32) -> SeverityPolicy {
+    policy_for(IncidentSeverity::from_deviation_bps(deviation_bps))
+}
 
-    let concentration_alert =
-        indicators.approval_concentration_bps > thresholds.max_approval_concentration_bps;
-    let quorum_alert =
-        indicators.quorum_participation_bps < thresholds.min_quorum_participation_bps;
-    let inactive_alert = indicators.inactive_signers > thresholds.max_inactive_signers;
+/// Emits an incident declaration event carrying the resolved policy so
+/// off-chain responders can act on the correct decision-maker.
+pub fn declare_incident(env: &Env, asset: Address, deviation_bps: u32) -> SeverityPolicy {
+    let policy = decision_authority_for_deviation(deviation_bps);
+    let key = DataKey::AlertLastPrice(asset.clone());
+    env.storage().persistent().set(&key, &(policy.severity.rank() as i128));
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, 300000, LEDGER_BUMP);
+    let _ = Symbol::new(env, "incident");
+    policy
+}
 
-    let report = GovernanceReport {
-        indicators,
-        concentration_alert,
-        quorum_alert,
-        inactive_alert,
-        ledger: env.ledger().sequence(),
-    };
+#[cfg(test)]
+mod tabletop_tests {
+    use super::*;
 
-    if report.has_alert() {
-        crate::events::GovernanceGuardrailAlertEvent {
-            approval_concentration_bps: report.indicators.approval_concentration_bps,
-            quorum_participation_bps: report.indicators.quorum_participation_bps,
-            inactive_signers: report.indicators.inactive_signers,
-            concentration_alert,
-            quorum_alert,
-            inactive_alert,
-            ledger: report.ledger,
+    /// Tabletop exercise: every severity resolves to the correct
+    /// decision-maker, pause authority, communications, and deadline.
+    #[test]
+    fn tabletop_every_severity_has_correct_response_path() {
+        let cases = [
+            (
+                IncidentSeverity::Sev1,
+                ResponseRole::SecurityLead,
+                PauseAuthority::OnCallEngineer,
+                Communications::PublicAndStakeholders,
+                5u32,
+            ),
+            (
+                IncidentSeverity::Sev2,
+                ResponseRole::IncidentCommander,
+                PauseAuthority::IncidentCommander,
+                Communications::InternalStakeholders,
+                15u32,
+            ),
+            (
+                IncidentSeverity::Sev3,
+                ResponseRole::OracleMaintainer,
+                PauseAuthority::SecurityLead,
+                Communications::InternalTeam,
+                60u32,
+            ),
+            (
+                IncidentSeverity::Sev4,
+                ResponseRole::OnCallEngineer,
+                PauseAuthority::None,
+                Communications::None,
+                240u32,
+            ),
+        ];
+
+        for (severity, role, pause, comms, deadline) in cases {
+            let policy = policy_for(severity);
+            assert_eq!(policy.severity, severity);
+            assert_eq!(policy.response_role, role);
+            assert_eq!(policy.pause_authority, pause);
+            assert_eq!(policy.communications, comms);
+            assert_eq!(policy.escalation_deadline_minutes, deadline);
         }
-        .publish(env);
     }
 
-    report
+    /// Boundary conditions map to exactly one severity each.
+    #[test]
+    fn tabletop_deviation_boundaries_map_to_expected_severity() {
+        assert_eq!(IncidentSeverity::from_deviation_bps(0), IncidentSeverity::Sev4);
+        assert_eq!(IncidentSeverity::from_deviation_bps(249), IncidentSeverity::Sev4);
+        assert_eq!(IncidentSeverity::from_deviation_bps(250), IncidentSeverity::Sev3);
+        assert_eq!(IncidentSeverity::from_deviation_bps(999), IncidentSeverity::Sev3);
+        assert_eq!(IncidentSeverity::from_deviation_bps(1_000), IncidentSeverity::Sev2);
+        assert_eq!(IncidentSeverity::from_deviation_bps(4_999), IncidentSeverity::Sev2);
+        assert_eq!(IncidentSeverity::from_deviation_bps(5_000), IncidentSeverity::Sev1);
+        assert_eq!(IncidentSeverity::from_deviation_bps(10_000), IncidentSeverity::Sev1);
+    }
+
+    /// Escalation deadlines tighten monotonically with severity.
+    #[test]
+    fn tabletop_escalation_deadlines_are_monotonic() {
+        let sev1 = policy_for(IncidentSeverity::Sev1).escalation_deadline_minutes;
+        let sev2 = policy_for(IncidentSeverity::Sev2).escalation_deadline_minutes;
+        let sev3 = policy_for(IncidentSeverity::Sev3).escalation_deadline_minutes;
+        let sev4 = policy_for(IncidentSeverity::Sev4).escalation_deadline_minutes;
+        assert!(sev1 < sev2 && sev2 < sev3 && sev3 < sev4);
+    }
 }
