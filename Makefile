@@ -22,6 +22,7 @@
 #   secret-scan        - secret scan of the tree, with a history report (#502)
 #   check-pins         - every dependency pinned exactly, lockfile in sync (#501)
 #   reproducible-build - two clean builds must produce identical WASM (#501)
+#   params-review      - production init parameter review, rejects out-of-policy (#609)
 
 # Determinism & Interleaving Suite (#516)
 #
@@ -31,7 +32,7 @@
 .PHONY: all build test lint fmt check clean watch gas-gate load-test \
         mutation-gate mutation-per-module hermetic sast secret-scan \
         check-pins reproducible-build security rpc-gate indexer-trust \
-        tx-review-gate redaction-gate trust-boundary
+        tx-review-gate redaction-gate trust-boundary params-review
 
 all: build test
 
@@ -107,6 +108,12 @@ redaction-gate:
 trust-boundary: rpc-gate indexer-trust tx-review-gate redaction-gate
 	python3 -m pytest services/rpc_guard services/indexer services/tx_review \
 		services/evidence_redaction -q
+
+# #609: production initialization parameter review. Validates each deployment's
+# min-source quorum, decimals, history retention and descriptions against the
+# documented policy bounds and fails on any out-of-policy production value.
+params-review:
+	python3 -m services.params_review.gate --report security-artifacts/params-review.md
 
 # Run clippy linter
 lint:
