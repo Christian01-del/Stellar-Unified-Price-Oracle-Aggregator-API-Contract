@@ -61,6 +61,13 @@ For proposals related to contract upgrades, parameter changes, source additions/
 
 Submit completed proposals as a GitHub issue or pull request for community review before any on-chain action is taken.
 
+## Mainnet Release Go/No-Go
+
+Before any mainnet release, complete the [mainnet release checklist](docs/mainnet-release-checklist.md).
+Each production gate must record an owner, an evidence link, and an explicit pass/fail result.
+The release workflow runs `scripts/check-release-evidence.sh`, which blocks the release when any
+mandatory evidence is absent. Never commit secrets or production credentials as evidence.
+
 ## Contributor Ladder
 
 The contributor ladder is a security control as much as a recognition scheme. Access escalates
