@@ -1,1 +1,28 @@
 # One asset contract id per line, compared by the canary pipeline.
+#
+# Source availability and coverage review cadence (issue #648)
+# ---------------------------------------------------------------
+# The periodic coverage review (see .github/workflows/source-coverage-review.yml)
+# reads this file to determine which assets are expected to be covered by the
+# configured sources. Assets listed here that fall below the configured
+# diversity threshold are flagged in the generated review artifact.
+#
+# Diversity threshold: minimum number of distinct sources that must report a
+# price for an asset before it is considered "covered". Override per-run with
+# the SOURCE_DIVERSITY_THRESHOLD environment variable; defaults to 2.
+#
+# Owner assignment: the review assigns an owner per flagged asset using the
+# mapping below (asset contract id -> GitHub handle or team). Assets without an
+# explicit mapping fall back to the default owner. Keep this mapping in sync
+# with CODEOWNERS where applicable.
+#
+# Format:
+#   <asset_contract_id>            # expected coverage, default owner
+#   <asset_contract_id> <owner>    # expected coverage, explicit owner
+#
+# Example (uncomment and replace with real contract ids):
+# CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC @stellar/oracle-oncall
+# CAQCFVLOBK5GIULPNZRGATJJYMLOWVQXKH43YH45HQEKCR6OSAHHE @stellar/oracle-oncall
+#
+# Default owner used when an asset has no explicit mapping:
+# owner: @stellar/oracle-oncall

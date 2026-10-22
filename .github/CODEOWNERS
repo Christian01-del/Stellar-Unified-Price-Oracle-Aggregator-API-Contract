@@ -3,3 +3,9 @@
 /docs/docs-freshness-baseline.txt @Stellar-Unified-Price-Oracle/maintainers
 # Onboarding mentors roster (#542).
 /docs/onboarding/                 @Stellar-Unified-Price-Oracle/maintainers
+# Source availability and coverage review cadence (#648):
+# the review workflow, its config, and generated review artifacts are owned
+# by maintainers so cadence/threshold changes get a reviewable owner.
+/.github/workflows/source-coverage-review.yml @Stellar-Unified-Price-Oracle/maintainers
+/config/source-coverage-review.toml           @Stellar-Unified-Price-Oracle/maintainers
+/docs/source-coverage-review.md               @Stellar-Unified-Price-Oracle/maintainers
