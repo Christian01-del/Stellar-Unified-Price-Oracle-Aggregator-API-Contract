@@ -4,6 +4,14 @@
 //! the guardian recovery path, and scripts the recovery drill end to end.
 //! The capability list and residual risk are documented in
 //! `docs/security/admin-compromise-drill.md`.
+//!
+//! # #653 — Production multisig policy and signer eligibility
+//!
+//! Encodes the production multisig policy as a repeatable check: signer
+//! independence, eligibility, conflict declaration/mitigation, rotation
+//! cadence, and documented key custody for critical actions. The policy is
+//! documented in `docs/security/multisig-policy.md`; the review checklist
+//! below records required signers and rejects an unmitigated conflict.
 
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
@@ -168,4 +176,167 @@ fn recovery_drill_end_to_end() {
 
 fn code(c: ErrorCode) -> soroban_sdk::Error {
     soroban_sdk::Error::from_contract_error(c as u32)
+}
+
+// ---------------------------------------------------------------------------
+// #653 — Production multisig policy and signer eligibility
+// ---------------------------------------------------------------------------
+
+/// Rotation cadence for production signers, in ledgers (~90 days at 5s/ledger).
+const ROTATION_CADENCE_LEDGERS: u32 = 1_555_200;
+/// Maximum age a signer key may reach before it must be rotated.
+const MAX_SIGNER_AGE_LEDGERS: u32 = ROTATION_CADENCE_LEDGERS;
+/// Minimum number of independent signers required for critical actions.
+const MIN_INDEPENDENT_SIGNERS: u32 = 3;
+
+/// A declared conflict of interest on a signer, with optional mitigation.
+struct Conflict {
+    declared: bool,
+    mitigated: bool,
+}
+
+/// A production signer under the multisig policy.
+struct Signer {
+    address: Address,
+    /// Custody/control domain (e.g. org or HSM operator). Signers sharing a
+    /// domain are not independent.
+    custody_domain: u32,
+    /// Ledger at which the key was provisioned; drives rotation cadence.
+    provisioned_at: u32,
+    /// Whether the signer meets eligibility criteria (vetted, bonded, etc.).
+    eligible: bool,
+    conflict: Conflict,
+}
+
+/// Signer independence: no two signers may share a custody/control domain.
+fn signers_are_independent(signers: &[Signer]) -> bool {
+    for (i, a) in signers.iter().enumerate() {
+        for b in signers.iter().skip(i + 1) {
+            if a.custody_domain == b.custody_domain {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Signer eligibility: every signer must be vetted and within rotation age.
+fn signers_are_eligible(signers: &[Signer], now: u32) -> bool {
+    signers.iter().all(|s| {
+        s.eligible && now.saturating_sub(s.provisioned_at) <= MAX_SIGNER_AGE_LEDGERS
+    })
+}
+
+/// A declared conflict must carry a mitigation; an undeclared conflict is
+/// treated as absent. Returns false when a declared conflict lacks mitigation.
+fn conflicts_are_mitigated(signers: &[Signer]) -> bool {
+    signers
+        .iter()
+        .all(|s| !s.conflict.declared || s.conflict.mitigated)
+}
+
+/// Full review checklist: records required signers and rejects a declared
+/// conflict without mitigation.
+fn review_checklist_passes(signers: &[Signer], now: u32) -> bool {
+    signers.len() as u32 >= MIN_INDEPENDENT_SIGNERS
+        && signers_are_independent(signers)
+        && signers_are_eligible(signers, now)
+        && conflicts_are_mitigated(signers)
+}
+
+fn make_signer(e: &Env, domain: u32, provisioned_at: u32) -> Signer {
+    Signer {
+        address: Address::generate(e),
+        custody_domain: domain,
+        provisioned_at,
+        eligible: true,
+        conflict: Conflict {
+            declared: false,
+            mitigated: false,
+        },
+    }
+}
+
+fn compliant_signers(e: &Env, now: u32) -> Vec<Signer> {
+    let mut v: Vec<Signer> = Vec::new(e);
+    v.push_back(make_signer(e, 1, now));
+    v.push_back(make_signer(e, 2, now));
+    v.push_back(make_signer(e, 3, now));
+    v
+}
+
+#[test]
+fn compliant_multisig_passes_review_checklist() {
+    let e = Env::default();
+    let now = 10_000u32;
+    let signers = compliant_signers(&e, now);
+    assert!(review_checklist_passes(&signers, now));
+}
+
+#[test]
+fn shared_custody_domain_fails_independence() {
+    let e = Env::default();
+    let now = 10_000u32;
+    let mut signers = compliant_signers(&e, now);
+    // Two signers under the same custody domain are not independent.
+    signers.get_mut(1).unwrap().custody_domain = 1;
+    assert!(!signers_are_independent(&signers));
+    assert!(!review_checklist_passes(&signers, now));
+}
+
+#[test]
+fn ineligible_signer_fails_eligibility() {
+    let e = Env::default();
+    let now = 10_000u32;
+    let mut signers = compliant_signers(&e, now);
+    signers.get_mut(0).unwrap().eligible = false;
+    assert!(!signers_are_eligible(&signers, now));
+    assert!(!review_checklist_passes(&signers, now));
+}
+
+#[test]
+fn stale_signer_fails_rotation_cadence() {
+    let e = Env::default();
+    let now = 10_000u32;
+    let mut signers = compliant_signers(&e, now);
+    // Provisioned beyond the rotation cadence ago.
+    signers.get_mut(2).unwrap().provisioned_at = now - MAX_SIGNER_AGE_LEDGERS - 1;
+    assert!(!signers_are_eligible(&signers, now));
+    assert!(!review_checklist_passes(&signers, now));
+}
+
+#[test]
+fn declared_conflict_without_mitigation_is_rejected() {
+    let e = Env::default();
+    let now = 10_000u32;
+    let mut signers = compliant_signers(&e, now);
+    signers.get_mut(0).unwrap().conflict = Conflict {
+        declared: true,
+        mitigated: false,
+    };
+    assert!(!conflicts_are_mitigated(&signers));
+    assert!(!review_checklist_passes(&signers, now));
+}
+
+#[test]
+fn declared_conflict_with_mitigation_is_accepted() {
+    let e = Env::default();
+    let now = 10_000u32;
+    let mut signers = compliant_signers(&e, now);
+    signers.get_mut(0).unwrap().conflict = Conflict {
+        declared: true,
+        mitigated: true,
+    };
+    assert!(conflicts_are_mitigated(&signers));
+    assert!(review_checklist_passes(&signers, now));
+}
+
+#[test]
+fn insufficient_signers_fail_review_checklist() {
+    let e = Env::default();
+    let now = 10_000u32;
+    let mut signers: Vec<Signer> = Vec::new(&e);
+    signers.push_back(make_signer(&e, 1, now));
+    signers.push_back(make_signer(&e, 2, now));
+    assert!(!review_checklist_passes(&signers, now));
 }
