@@ -9,59 +9,7 @@ use crate::storage::{
 };
 use crate::types::{AssetMetadata, AssetMetadataUpdate, DataKey, ErrorCode, PriceBounds};
 
-/// Blast-radius preview for a proposed parameter change.
-///
-/// Computed without mutating any state so governance can review the impact of a
-/// global or per-asset change before applying it. `asset` is `None` for a
-/// global-scope change (affects every registered asset) and `Some(addr)` for a
-/// per-asset change.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ParameterChangePreview {
-    /// True when the change applies to every registered asset.
-    pub is_global: bool,
-    /// Assets affected by the change (all registered assets for global scope).
-    pub affected_assets: Vec<Address>,
-    /// Number of assets affected by the change.
-    pub affected_count: u32,
-    /// Source quorum required to authorize the change.
-    pub source_quorum: u32,
-    /// Whether the change is recorded in the on-chain history log.
-    pub history_recorded: bool,
-    /// Consumer-visible effects of the change (e.g. bounds, pause, breaker).
-    pub consumer_visible_effects: Vec<soroban_sdk::Symbol>,
-}
-
-/// Compute the blast radius of a proposed parameter change without mutating
-/// state. `asset` is `None` for a global-scope change and `Some(addr)` for a
-/// per-asset change.
-pub fn preview_parameter_change(env: &Env, asset: Option<Address>) -> ParameterChangePreview {
-    let (is_global, affected_assets) = match asset {
-        Some(addr) => {
-            crate::storage::check_registered_asset(env, &addr);
-            let mut single: Vec<Address> = Vec::new(env);
-            single.push_back(addr);
-            (false, single)
-        }
-        None => (true, read_registered_assets(env)),
-    };
-
-    let affected_count = affected_assets.len() as u32;
-    let source_quorum = crate::admin::get_quorum(env);
-
-    let mut effects: Vec<soroban_sdk::Symbol> = Vec::new(env);
-    effects.push_back(symbol_short!("bounds"));
-    effects.push_back(symbol_short!("pause"));
-    effects.push_back(symbol_short!("breaker"));
-
-    ParameterChangePreview {
-        is_global,
-        affected_assets,
-        affected_count,
-        source_quorum,
-        history_recorded: true,
-        consumer_visible_effects: effects,
-    }
-}
+pub const MAX_ASSET_QUERY_SIZE: u32 = 100;
 
 pub fn register_asset(env: &Env, asset: Address) {
     let admin = get_admin(env);
@@ -99,6 +47,48 @@ pub fn register_asset(env: &Env, asset: Address) {
     }
     .publish(env);
     emit_admin_action(env, symbol_short!("reg_asset"), admin, Bytes::new(env));
+}
+
+pub fn get_registered_assets_paginated(
+    env: &Env,
+    cursor: Option<Address>,
+    limit: u32,
+) -> (Vec<Address>, Option<Address>) {
+    if limit == 0 || limit > crate::history::MAX_PAGE_SIZE {
+        panic_with_error!(env, ErrorCode::InvalidPageSize);
+    }
+
+    let registered = read_registered_assets(env);
+    let start = match cursor {
+        Some(last_asset) => {
+            let mut next_index = None;
+            for i in 0..registered.len() {
+                if registered.get_unchecked(i) == last_asset {
+                    next_index = Some(i + 1);
+                    break;
+                }
+            }
+            match next_index {
+                Some(index) => index,
+                None => panic_with_error!(env, ErrorCode::InvalidPageCursor),
+            }
+        }
+        None => 0,
+    };
+
+    let mut page: Vec<Address> = Vec::new(env);
+    let mut index = start;
+    while index < registered.len() && page.len() < limit {
+        page.push_back(registered.get_unchecked(index));
+        index += 1;
+    }
+
+    let next_cursor = if index < registered.len() {
+        Some(page.get_unchecked(page.len() - 1))
+    } else {
+        None
+    };
+    (page, next_cursor)
 }
 
 pub fn unregister_asset(env: &Env, asset: Address) {
