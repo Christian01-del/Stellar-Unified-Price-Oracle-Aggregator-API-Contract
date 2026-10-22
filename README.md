@@ -154,6 +154,87 @@ export ORACLE_NETWORK=testnet        # default: testnet
 ./scripts/oracle-cli.sh health-check
 ```
 
+## Integration Support: Intake & Triage
+
+Consumers integrating the oracle (wallets, lending markets, indexers, dashboards) can file
+integration reports through a single public path. This section defines where to file, what to
+include, who responds, and how reports are routed by severity.
+
+### Public filing path
+
+File integration reports as a GitHub issue in this repository using the
+**Integration Report** template (`.github/ISSUE_TEMPLATE/integration_report.md`).
+
+- One report per issue; do not bundle unrelated problems.
+- Do **not** file reports via DM, email, or comments on unrelated issues — those are not tracked.
+- Security-sensitive reports (key exposure, exploitable contract behavior) must **not** be filed
+  publicly; follow `SECURITY.md` for private disclosure instead.
+
+### Required reproduction data
+
+Every report must include the following so it can be reproduced and triaged:
+
+| Field | Description |
+|-------|-------------|
+| Network | `testnet`, `futurenet`, or `mainnet` |
+| Contract ID | Deployed contract address (`C...`) |
+| SDK / client version | `stellar` CLI, `soroban-sdk`, or client library version |
+| Endpoint | Contract function or SEP-40 method involved (e.g. `lastprice`, `price`) |
+| Asset | Asset identifier passed to the call |
+| Expected vs actual | Observed result and what you expected |
+| Reproduction steps | Minimal ordered steps or a script/snippet |
+| Error output | Full error message or transaction hash (redact secrets) |
+| Timestamp / ledger | When the issue occurred (UTC timestamp and/or ledger) |
+
+**Never include** secret keys, signed XDR containing secrets, admin credentials, or API tokens.
+Redact addresses only if they are sensitive; public contract/asset IDs are fine to share.
+
+### Response ownership
+
+| Role | Responsibility |
+|------|----------------|
+| **Intake triager** (on-call maintainer) | Acknowledges new reports, applies severity label, assigns owner |
+| **Integration owner** | Reproduces, diagnoses, and drives the fix or workaround |
+| **Contract maintainer** | Owns contract-side fixes and releases |
+| **Docs owner** | Updates consumer docs when behavior or guidance changes |
+
+The on-call maintainer acknowledges within **2 business days** and assigns an owner. The
+owner posts a status update at least weekly until the report is closed.
+
+### Severity routing
+
+| Severity | Definition | Routing |
+|----------|------------|---------|
+| **S1 — Critical** | Consumer funds at risk, wrong prices served, or contract unavailable | Page on-call immediately; private channel if security-relevant; fix prioritized above all else |
+| **S2 — High** | Integration broken with no workaround; incorrect but non-critical data | Assigned to integration owner same day; target fix in next release |
+| **S3 — Medium** | Degraded behavior with a documented workaround | Triaged within 2 business days; scheduled normally |
+| **S4 — Low** | Docs gaps, questions, cosmetic issues | Triaged within 5 business days; may be resolved via docs |
+
+### Sample report
+
+A minimal, secret-free report that traces to a triage category:
+
+```
+Title: [Integration] lastprice returns None for registered asset on testnet
+
+Network: testnet
+Contract ID: CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4
+SDK / client version: stellar CLI 22.0.0, soroban-sdk 26.0.0
+Endpoint: lastprice(asset)
+Asset: CCCC... (registered via register_asset)
+Expected: Some(PriceData) with latest aggregated price
+Actual: None returned even though two sources submitted prices
+Reproduction steps:
+  1. ./scripts/oracle-cli.sh register-asset --asset CCCC... --admin-key <redacted>
+  2. ./scripts/oracle-cli.sh submit-price --source GBBB... --asset CCCC... --price 50000000000000000000 --source-key <redacted>
+  3. ./scripts/oracle-cli.sh get-price --asset CCCC...
+Error output: (none; returns None)
+Timestamp / ledger: 2025-01-01T00:00:00Z, ledger 1234567
+```
+
+This sample traces to **S2 — High** (integration broken, no workaround) and is routed to the
+integration owner. It contains no secret keys or credentials.
+
 ## Getting Started
 
 ### Prerequisites
@@ -217,75 +298,3 @@ contracts/price-oracle/
 | Layer | Technology |
 |-------|-----------|
 | Contract | Rust, Soroban SDK v26 |
-| Target | `wasm32v1-none` (WebAssembly) |
-| Aggregation | On-chain median (Rust) |
-| Testing | `#[cfg(test)]` with `soroban-sdk/testutils` |
-
-## Error Codes
-
-| Code | Name | Description |
-|------|------|-------------|
-| 0 | `NotAuthorized` | Caller is not the admin or required signer |
-| 1 | `AlreadyInitialized` | Contract already initialized |
-| 2 | `AssetNotRegistered` | Asset not found |
-| 3 | `AssetAlreadyRegistered` | Asset already registered |
-| 4 | `SourceAlreadyExists` | Source already registered |
-| 5 | `SourceNotFound` | Source not found |
-| 6 | `InsufficientSources` | Not enough sources for aggregation |
-| 7 | `InvalidPrice` | Price is zero or negative |
-| 8 | `NoData` | No price data available (or gap with interpolation disabled) |
-| 9 | `InvalidTimestamp` | Submitted timestamp too far in the future |
-| 10 | `InvalidConfiguration` | Configuration parameter out of valid range |
-| 11 | `DescriptionTooLong` | Description exceeds 256 characters |
-| 12 | `ContractPaused` | Contract is paused; operations blocked |
-| 13 | `TimelockNotReady` | Timelock delay has not elapsed |
-| 14 | `OperationNotFound` | No pending timelock operation with that ID |
-| 15 | `PriceBelowMinimum` | Price is below the asset's configured minimum |
-
-See [`docs/error-codes.md`](docs/error-codes.md) for the full registry with causes and resolutions.
-
-## Documentation
-
-| Document | Description |
-|---|---|
-| [Architecture](docs/ARCHITECTURE.md) | System design, data flow, module structure |
-| [Hackathon Bounty Track](docs/hackathon-bounty-track.md) | Hackathon bounty track definition, curated project ideas, judging rubric, and reward tiers |
-| [Deployment Record](docs/deployment.md) | Contract addresses, initialization parameters, admin addresses, deployment checklist |
-| [Security Audit Checklist](docs/security-audit-checklist.md) | Pre-audit review items: access control, input validation, arithmetic safety, storage safety, upgrade mechanism, event integrity, known patterns |
-| [Attack-Regression Corpus](docs/security/attack-regression-corpus.md) | Every historical adversarial scenario pinned as a test, by attack class, with a mutation check proving the corpus has teeth (#511) |
-| [Formal Verification](docs/security/formal-verification.md) | Bounded proofs for the aggregation math, the stated bounded domain, and the proven-vs-sampled split (#512) |
-| [State-Machine Model](docs/security/state-machine-model.md) | Independently written model of the aggregate lifecycle, driven by shrinking random traces (#513) |
-| [Coverage-Guided Fuzzing](docs/security/fuzzing.md) | Fuzz targets, the committed minimized corpus, and the CI crash and size gates (#514) |
-| [Monitoring Dashboard](docs/monitoring/README.md) | Grafana dashboard setup and metrics reference |
-| [Quickstart Templates](examples/README.md) | CI-tested web (SEP-40), Python bot and indexer templates |
-| [Interface Package](docs/interface-versioning.md) | Versioned `@stellar-unified-price-oracle/interface` npm package, semver rules, deprecation policy |
-| [Error Registry](docs/errors/REGISTRY.md) | Every error code with meaning, cause and remediation ([JSON](docs/errors/registry.json)) |
-| [Migration Guides](docs/migrations/README.md) | Per-version guides for breaking changes and deprecation windows |
-| [Integration Case Studies](docs/case-studies.md) | Lending, DEX and payments integrations with threat models, worked exploits and countermeasures |
-| [Seam Invariant Catalogue](docs/seam-invariants.md) | Cross-module invariants and the regression tests that enforce them |
-| [SLA](docs/SLA.md) | Service levels and the machine-enforceable clause map checked by `services/sla_monitor` |
-| [Runbook](docs/runbook.md) | Every paging alert mapped to meaning, first check, mitigation, escalation, resolution, owner and review cadence (#527) |
-| [Incident Management](docs/incident-management/README.md) | Blameless postmortem process, template, index and tracked action items (#528) |
-| [Backup and Restore](docs/backup-restore.md) | Off-chain state inventory, encrypted backups, point-in-time restore and reconciliation (#529) |
-| [Capacity Planning](docs/capacity-planning.md) | Ingest, storage and ledger-budget model with headroom targets and load shedding (#530) |
-| [Price Revision Metrics](docs/price-revision-metrics.md) | Correction-rate metric per asset and per source, cause separation, volume normalization and sustained-increase alerting (#499) |
-| [Static Analysis](docs/static-analysis.md) | SAST rules, dependency-advisory gate, owned+expiring allowlist and the re-baseline process (#500) |
-| [Reproducible Builds](docs/reproducible-builds.md) | Exact dependency pins, canonical containerized build environment, two-build digest check (#501) |
-| [Secret Scanning](docs/secret-scanning.md) | Pre-commit and CI secret scanning, history scan, allowlist process and the rotation playbook (#502) |
-
-## Documentation
-
-- [Hackathon Bounty Track](docs/hackathon-bounty-track.md) — reusable hackathon track definition, curated ideas mapped to open issues, judging rubric, and reward tiers (#407)
-- [Price Submission Bot Design](docs/price-submission-bot.md) — off-chain bot architecture for automated price submissions
-- [Signed CEX/Aggregator Adapters](docs/signed-price-adapters.md) — CoinGecko/Binance/Coinbase adapters with failover, staleness handling, and signed submission (#216)
-- [Disaster Recovery Plan](docs/disaster-recovery.md) — failure scenario playbooks and recovery procedures
-- [Architecture](docs/ARCHITECTURE.md) — contract design and data flow
-- [Monitoring](docs/monitoring/README.md) — Grafana dashboard and alerting setup
-
-## License
-
-MIT
-
-## Service Level Agreement
-
-See [docs/SLA.md](docs/SLA.md) for price freshness guarantees, uptime commitments, deviation thresholds, incident response times, and compensation terms.
