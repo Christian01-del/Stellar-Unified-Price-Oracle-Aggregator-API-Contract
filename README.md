@@ -70,7 +70,8 @@ A **decentralized price oracle aggregator** built on Soroban (Stellar smart cont
 | Function | Description |
 |----------|-------------|
 | `get_historical_price(asset, ledger) -> PriceHistoryEntry` | Get historical price at a specific ledger (interpolated if enabled) |
-| `get_historical_prices(asset, start, end) -> Vec<PriceHistoryEntry>` | Get historical prices in a ledger range |
+| `get_historical_prices(asset, start, end) -> Vec<PriceHistoryEntry>` | Get historical prices in an inclusive range of up to 50 ledger numbers |
+| `get_historical_prices_paginated(asset, cursor, limit)` | Get up to 50 entries in ascending ledger order; pass `next_cursor` to continue |
 | `has_historical_price(asset, ledger) -> bool` | Check if historical price exists |
 | `set_interpolation_enabled(bool)` | Enable/disable linear interpolation for history gaps (admin) |
 | `get_interpolation_enabled() -> bool` | Check if interpolation is enabled |
@@ -80,11 +81,12 @@ A **decentralized price oracle aggregator** built on Soroban (Stellar smart cont
 | Function | Description |
 |----------|-------------|
 | `base() → Asset` | Returns the base asset (USD) |
-| `assets() → Vec<Asset>` | Returns all registered assets as `Asset::Stellar` |
+| `assets() → Vec<Asset>` | Returns all registered assets as `Asset::Stellar` (maximum 100; use pagination for larger registries) |
+| `assets_paginated(cursor, limit)` | Get up to 50 assets in registration order; pass `next_cursor` to continue |
 | `decimals() → u32` | Returns price decimals |
 | `resolution() → u32` | Returns staleness window in seconds (0 = no expiry) |
 | `price(asset, timestamp) → Option<PriceData>` | Get price at or before a given timestamp |
-| `prices(asset, records) → Option<Vec<PriceData>>` | Get latest N historical price records |
+| `prices(asset, records) → Option<Vec<PriceData>>` | Get up to 50 latest historical price records |
 | `lastprice(asset) → Option<PriceData>` | Get latest aggregated price |
 
 ### Contract Events
@@ -153,6 +155,23 @@ export ORACLE_NETWORK=testnet        # default: testnet
 # Health check
 ./scripts/oracle-cli.sh health-check
 ```
+
+### Query response limits and cursors
+
+Historical range queries include at most 50 ledger numbers, and the SEP-40
+`prices` query returns at most 50 records. For longer history reads, call
+`get_historical_prices_paginated(asset, cursor, limit)` with `cursor = 0` on
+the first request and pass each returned `next_cursor` unchanged; it identifies
+the first ledger to include on the next page. Results are in ascending ledger
+order and gaps are skipped.
+
+The full `assets()` and `list_assets()` responses are capped at 100 assets.
+Use `assets_paginated(cursor, limit)` for larger registries: start with
+`cursor = None`, then pass the last returned asset as the next cursor. This
+preserves registration order without repeats. If that cursor asset has been
+unregistered, the contract returns `InvalidPageCursor`; restart from the first
+page to avoid silently omitting assets. Page limits for both paginated query
+families are 1–50.
 
 ## Getting Started
 
