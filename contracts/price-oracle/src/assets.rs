@@ -9,6 +9,60 @@ use crate::storage::{
 };
 use crate::types::{AssetMetadata, AssetMetadataUpdate, DataKey, ErrorCode, PriceBounds};
 
+/// Blast-radius preview for a proposed parameter change.
+///
+/// Computed without mutating any state so governance can review the impact of a
+/// global or per-asset change before applying it. `asset` is `None` for a
+/// global-scope change (affects every registered asset) and `Some(addr)` for a
+/// per-asset change.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ParameterChangePreview {
+    /// True when the change applies to every registered asset.
+    pub is_global: bool,
+    /// Assets affected by the change (all registered assets for global scope).
+    pub affected_assets: Vec<Address>,
+    /// Number of assets affected by the change.
+    pub affected_count: u32,
+    /// Source quorum required to authorize the change.
+    pub source_quorum: u32,
+    /// Whether the change is recorded in the on-chain history log.
+    pub history_recorded: bool,
+    /// Consumer-visible effects of the change (e.g. bounds, pause, breaker).
+    pub consumer_visible_effects: Vec<soroban_sdk::Symbol>,
+}
+
+/// Compute the blast radius of a proposed parameter change without mutating
+/// state. `asset` is `None` for a global-scope change and `Some(addr)` for a
+/// per-asset change.
+pub fn preview_parameter_change(env: &Env, asset: Option<Address>) -> ParameterChangePreview {
+    let (is_global, affected_assets) = match asset {
+        Some(addr) => {
+            crate::storage::check_registered_asset(env, &addr);
+            let mut single: Vec<Address> = Vec::new(env);
+            single.push_back(addr);
+            (false, single)
+        }
+        None => (true, read_registered_assets(env)),
+    };
+
+    let affected_count = affected_assets.len() as u32;
+    let source_quorum = crate::admin::get_quorum(env);
+
+    let mut effects: Vec<soroban_sdk::Symbol> = Vec::new(env);
+    effects.push_back(symbol_short!("bounds"));
+    effects.push_back(symbol_short!("pause"));
+    effects.push_back(symbol_short!("breaker"));
+
+    ParameterChangePreview {
+        is_global,
+        affected_assets,
+        affected_count,
+        source_quorum,
+        history_recorded: true,
+        consumer_visible_effects: effects,
+    }
+}
+
 pub fn register_asset(env: &Env, asset: Address) {
     let admin = get_admin(env);
     admin.require_auth();
@@ -248,107 +302,6 @@ pub fn set_price_bounds(
 
 pub fn get_price_bounds(env: &Env, asset: Address) -> PriceBounds {
     crate::storage::check_registered_asset(env, &asset);
-    let key = DataKey::AssetPriceBounds(asset.clone());
-    if env.storage().persistent().has(&key) {
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
-    }
-    env.storage().persistent().get(&key).unwrap_or(PriceBounds {
-        min_price: 0,
-        max_price: i128::MAX,
-        max_change_bps_per_ledger: 0,
-    })
-}
+    let key = DataK
 
-pub fn is_asset_paused(env: &Env, asset: &Address) -> bool {
-    let key = DataKey::AssetPauseFlag(asset.clone());
-    if env.storage().persistent().has(&key) {
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
-    }
-    env.storage().persistent().get(&key).unwrap_or(false)
-}
-
-pub fn set_asset_paused(env: &Env, asset: &Address, paused: bool) {
-    let key = DataKey::AssetPauseFlag(asset.clone());
-    env.storage().persistent().set(&key, &paused);
-}
-
-pub fn is_circuit_breaker_tripped(env: &Env, asset: &Address) -> bool {
-    let key = DataKey::AssetCircuitBreakerTripped(asset.clone());
-    if env.storage().persistent().has(&key) {
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
-    }
-    env.storage().persistent().get(&key).unwrap_or(false)
-}
-
-pub fn pause_asset(env: &Env, asset: Address) {
-    let admin = get_admin(env);
-    admin.require_auth();
-    crate::storage::check_registered_asset(env, &asset);
-    set_asset_paused(env, &asset, true);
-    emit_admin_action(env, symbol_short!("pause_ast"), admin, Bytes::new(env));
-}
-
-pub fn unpause_asset(env: &Env, asset: Address) {
-    let admin = get_admin(env);
-    admin.require_auth();
-    crate::storage::check_registered_asset(env, &asset);
-    set_asset_paused(env, &asset, false);
-    env.storage()
-        .persistent()
-        .set(&DataKey::AssetCircuitBreakerTripped(asset.clone()), &false);
-    CircuitBreakerResetEvent {
-        asset: asset.clone(),
-        admin: admin.clone(),
-    }
-    .publish(env);
-    emit_admin_action(env, symbol_short!("unp_asts"), admin, Bytes::new(env));
-}
-
-pub fn trip_circuit_breaker(
-    env: &Env,
-    asset: Address,
-    previous_price: i128,
-    candidate_price: i128,
-    change_bps: i128,
-    max_change_bps: u32,
-) {
-    set_asset_paused(env, &asset, true);
-    env.storage()
-        .persistent()
-        .set(&DataKey::AssetCircuitBreakerTripped(asset.clone()), &true);
-
-    let count_key = DataKey::AssetCircuitBreakerLogCount(asset.clone());
-    let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
-    let next_count = count + 1;
-    let entry = CircuitBreakerEventEntry {
-        asset: asset.clone(),
-        previous_price,
-        candidate_price,
-        change_bps: change_bps.min(i128::from(u32::MAX)) as u32,
-        max_change_bps,
-        ledger: env.ledger().sequence(),
-        timestamp: env.ledger().timestamp(),
-    };
-    env.storage().persistent().set(
-        &DataKey::AssetCircuitBreakerLog(asset.clone(), next_count),
-        &entry,
-    );
-    env.storage().persistent().set(&count_key, &next_count);
-
-    CircuitBreakerTrippedEvent {
-        asset: asset.clone(),
-        previous_price,
-        candidate_price,
-        change_bps: entry.change_bps,
-        max_change_bps,
-        ledger: env.ledger().sequence(),
-        timestamp: env.ledger().timestamp(),
-    }
-    .publish(env);
-}
+/* … truncated 3334 chars — edit only what you need near the top … */
