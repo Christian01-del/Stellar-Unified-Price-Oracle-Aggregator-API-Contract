@@ -40,8 +40,6 @@ __pycache__/
 .pytest_cache/
 
 # Environment / secrets
-.env
-.env.*
 !.env.example
 
 # IDE
@@ -128,3 +126,4 @@ cargo_out.txt
 .venv/
 .gitignore
 branch_structure.json
+config.bat
