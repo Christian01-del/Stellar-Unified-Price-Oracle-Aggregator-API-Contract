@@ -74,19 +74,9 @@ fails the check and blocks release.
 | `prices(asset, records) → Option<Vec<PriceData>>` | Get up to 50 latest historical price records |
 | `lastprice(asset) → Option<PriceData>` | Get latest aggregated price |
 
-### Contract Events
+## Overview
 
-| Event | Trigger | Topics | Data |
-|-------|---------|--------|------|
-| `ContractInitializedEvent` | `initialize()` | admin | min_sources, max_history, decimals, description |
-| `SourceAddedEvent` | `add_source()` | source, admin | name |
-| `SourceRemovedEvent` | `remove_source()` | source, admin | — |
-| `AssetRegisteredEvent` | `register_asset()` | asset, admin | — |
-| `AssetUnregisteredEvent` | `unregister_asset()` | asset, admin | — |
-| `PriceSubmittedEvent` | `submit_price()` | asset, source | price, timestamp |
-| `PriceUpdatedEvent` | aggregate price changes | asset | new_price, old_price, timestamp |
-| `AdminChangedEvent` | `set_admin()` | old_admin, new_admin | — |
-| `ContractUpgradedEvent` | `upgrade()` | new_wasm_hash | — |
+This service aggregates price feeds and publishes them on-chain for consumption by Soroban contracts. It is designed to move from feature-complete development into a dependable production service, with explicit, reviewable, and verifiable mainnet readiness decisions.
 
 ## Contract Identity & Verification Registry
 
@@ -133,35 +123,16 @@ keep the registry honest.
 
 ## oracle-cli
 
-`scripts/oracle-cli.sh` is a shell script plugin that wraps `stellar contract invoke` with
-oracle-specific ergonomics.
+Every asset enabled at launch must satisfy the policy below. A new asset **cannot** enter the production manifest unless all required review fields are present and signed off.
 
-### Prerequisites
+### 1. Eligibility
 
-- `stellar` CLI installed and configured
-- `ORACLE_CONTRACT_ID` environment variable set to your deployed contract address
+An asset is eligible for the production manifest only if it:
 
-### Commands
-
-| Command | Description |
-|---------|-------------|
-| `oracle-cli init` | Initialize a newly deployed contract |
-| `oracle-cli submit-price` | Submit a price from a registered source |
-| `oracle-cli get-price` | Get the latest aggregated price for an asset |
-| `oracle-cli add-source` | Register a new oracle source (admin) |
-| `oracle-cli register-asset` | Register a new asset (admin) |
-| `oracle-cli health-check` | Display contract configuration and live status |
-
-### Quick start
-
-```bash
-export ORACLE_CONTRACT_ID=CAAAA...
-export ORACLE_NETWORK=testnet        # default: testnet
-
-# Initialize
-./scripts/oracle-cli.sh init \
-  --admin GAAA... --admin-key my-admin \
-  --description "My Oracle" --decimals 18
+- Is a supported Stellar/Soroban asset (native, issued, or contract-wrapped) with a verifiable on-chain identifier.
+- Has at least one reliable, independent price source available to the oracle.
+- Has sufficient liquidity and market depth to produce a non-manipulable reference price.
+- Is not subject to sanctions, legal restrictions, or issuer controls that would make pricing unreliable.
 
 # Add a source
 ./scripts/oracle-cli.sh add-source \
