@@ -294,3 +294,6 @@ See [docs/SLA.md](docs/SLA.md) for price freshness guarantees, uptime commitment
 
 <!-- handsoff-issue-551 -->
 - #551: Fee redistribution policy and simulation
+
+<!-- handsoff-issue-564 -->
+- #564: Details removed; this report is intended to be private. It has been re-reported to the maintainer via email muhamadluis.z@gmail.com. Please do not disclose this information
