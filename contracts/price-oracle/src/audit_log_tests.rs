@@ -167,3 +167,53 @@ fn test_audit_log_all_admin_actions_tracked() {
     // Should have entries for all 3 actions
     assert!(entries.len() >= 3);
 }
+
+#[test]
+fn test_disputed_correction_preserves_original_audit_record() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, admin) = setup_contract(&e);
+
+    // A source disputes a measured contribution/payout for an epoch.
+    let source = Address::generate(&e);
+    client.add_source(&source, &String::from_str(&e, "DisputingSource"));
+
+    let disputed_epoch = 7u32;
+    let disputed_amount = 1_000i128;
+    let reason = String::from_str(&e, "measured contribution under-reported");
+
+    let appeal_id = client.submit_reward_appeal(
+        &source,
+        &disputed_epoch,
+        &disputed_amount,
+        &reason,
+    );
+
+    // The appeal is recorded but does not mutate the original audit record.
+    let count_before_resolution = client.get_audit_log_count();
+    let original_entries = client.get_admin_audit_log(&0u32, &count_before_resolution);
+    let original_len = original_entries.len();
+
+    // An authorized reviewer approves the appeal with a corrected amount.
+    let corrected_amount = 1_500i128;
+    client.approve_reward_appeal(&admin, &appeal_id, &corrected_amount);
+
+    // Resolution appends a correction record rather than overwriting history.
+    let count_after_resolution = client.get_audit_log_count();
+    assert!(count_after_resolution > count_before_resolution);
+
+    // The original audit records remain intact and unchanged.
+    let entries_after = client.get_admin_audit_log(&0u32, &count_after_resolution);
+    assert!(entries_after.len() >= original_len);
+    for i in 0..original_len {
+        let before = original_entries.get_unchecked(i);
+        let after = entries_after.get_unchecked(i);
+        assert_eq!(before.id, after.id);
+        assert_eq!(before.action, after.action);
+    }
+
+    // The correction is recorded and the chain still verifies.
+    let correction = client.get_reward_appeal(&appeal_id);
+    assert_eq!(correction.corrected_amount, corrected_amount);
+    assert!(client.verify_audit_chain());
+}

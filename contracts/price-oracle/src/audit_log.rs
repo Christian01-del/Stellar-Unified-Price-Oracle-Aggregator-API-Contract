@@ -3,6 +3,16 @@
 //! Implements an append-only audit trail for all admin actions with cryptographic
 //! hash chain to prevent tampering. Each entry includes a SHA-256 hash of the
 //! previous entry, forming an immutable chain.
+//!
+//! # Source reward appeals and corrections (#674)
+//!
+//! A source may dispute a measured contribution or payout by submitting an
+//! appeal. Appeals are recorded as audit entries (action `appeal`) carrying the
+//! source identity, the disputed epoch, the disputed amount and a reason. An
+//! authorized reviewer resolves the appeal by appending a `correct` audit entry
+//! that references the original appeal entry id. Corrections are *appended* to
+//! the chain; the original audit record is never mutated or overwritten, so the
+//! full dispute history remains verifiable via [`verify_audit_chain`].
 
 use soroban_sdk::{panic_with_error, symbol_short, Address, Bytes, Env, Symbol, Vec};
 
@@ -92,6 +102,95 @@ pub fn append_audit_entry(env: &Env, action: Symbol, admin: Address, data: Bytes
         ledger: current_ledger,
     }
     .publish(env);
+}
+
+/// Encode an appeal payload for storage in the audit log.
+///
+/// Layout: `source(32) || epoch(4 LE) || disputed_amount(16 LE) || reason`.
+/// The reason is appended verbatim so reviewers can inspect the full dispute.
+fn encode_appeal(env: &Env, source: &Address, epoch: u32, disputed_amount: i128, reason: &Bytes) -> Bytes {
+    let mut payload = Bytes::new(env);
+    payload.append(&Bytes::from_slice(env, &source.to_string().into_bytes().to_array()));
+    payload.append(&Bytes::from_slice(env, &epoch.to_le_bytes()));
+    payload.append(&Bytes::from_slice(env, &disputed_amount.to_le_bytes()));
+    payload.append(reason);
+    payload
+}
+
+/// Submit an appeal disputing a measured contribution or payout.
+///
+/// The source records a dispute against a specific epoch and amount. The appeal
+/// is appended to the audit chain as an `appeal` entry; the original measurement
+/// record is left untouched. Returns the id of the appended appeal entry so the
+/// reviewer can reference it when resolving.
+///
+/// # Arguments
+///
+/// * `env` - The Soroban execution environment.
+/// * `source` - The source disputing the measurement (must authorize).
+/// * `epoch` - The epoch whose contribution/payout is disputed.
+/// * `disputed_amount` - The amount the source believes is incorrect.
+/// * `reason` - Human-readable justification for the dispute.
+pub fn submit_reward_appeal(
+    env: &Env,
+    source: Address,
+    epoch: u32,
+    disputed_amount: i128,
+    reason: Bytes,
+) -> u32 {
+    source.require_auth();
+
+    let payload = encode_appeal(env, &source, epoch, disputed_amount, &reason);
+    append_audit_entry(env, symbol_short!("appeal"), source, payload);
+
+    get_audit_log_count(env)
+}
+
+/// Resolve a source reward appeal by appending a correction record.
+///
+/// Only the configured admin (reviewer) may approve a correction. The correction
+/// is appended as a `correct` audit entry that references the original appeal
+/// entry id and carries the approved amount. The original appeal entry is never
+/// modified, so the audit trail preserves both the dispute and its resolution.
+///
+/// # Arguments
+///
+/// * `env` - The Soroban execution environment.
+/// * `appeal_id` - The audit entry id of the appeal being resolved.
+/// * `approved_amount` - The corrected amount approved by the reviewer.
+/// * `note` - Reviewer justification recorded alongside the correction.
+///
+/// # Panics
+///
+/// Panics with `ErrorCode::Unauthorized` if the caller is not the admin, or with
+/// `ErrorCode::InvalidInput` if `appeal_id` does not reference an existing appeal.
+pub fn resolve_reward_appeal(env: &Env, appeal_id: u32, approved_amount: i128, note: Bytes) -> u32 {
+    let admin = get_admin(env);
+    admin.require_auth();
+
+    // The referenced entry must exist and be an appeal; corrections cannot be
+    // chained onto arbitrary or missing records.
+    let appeal: AuditEntry = match env
+        .storage()
+        .persistent()
+        .get::<_, AuditEntry>(&DataKey::AuditEntry(appeal_id))
+    {
+        Some(entry) => entry,
+        None => panic_with_error!(env, ErrorCode::InvalidInput),
+    };
+    if appeal.action != symbol_short!("appeal") {
+        panic_with_error!(env, ErrorCode::InvalidInput);
+    }
+
+    // Encode correction: appeal_id(4 LE) || approved_amount(16 LE) || note.
+    let mut payload = Bytes::new(env);
+    payload.append(&Bytes::from_slice(env, &appeal_id.to_le_bytes()));
+    payload.append(&Bytes::from_slice(env, &approved_amount.to_le_bytes()));
+    payload.append(&note);
+
+    append_audit_entry(env, symbol_short!("correct"), admin, payload);
+
+    get_audit_log_count(env)
 }
 
 /// Get audit log entries within a range.
@@ -234,4 +333,61 @@ pub fn get_audit_log_head(env: &Env) -> Bytes {
         .persistent()
         .get(&DataKey::AuditLogHead)
         .unwrap_or_else(|| Bytes::new(env))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    #[test]
+    fn resolving_appeal_appends_correction_without_overwriting_original() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let source = Address::generate(&env);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Admin, &admin);
+
+        let reason = Bytes::from_slice(&env, b"payout undercounted");
+        let appeal_id = submit_reward_appeal(&env, source.clone(), 7, 1_000, reason.clone());
+        assert_eq!(appeal_id, 1);
+
+        // Snapshot the original appeal record before resolution.
+        let original: AuditEntry = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AuditEntry(appeal_id))
+            .unwrap();
+
+        let note = Bytes::from_slice(&env, b"approved after review");
+        let correction_id = resolve_reward_appeal(&env, appeal_id, 1_500, note);
+        assert_eq!(correction_id, 2);
+
+        // Original appeal record is untouched.
+        let after: AuditEntry = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AuditEntry(appeal_id))
+            .unwrap();
+        assert_eq!(after.id, original.id);
+        assert_eq!(after.action, original.action);
+        assert_eq!(after.data, original.data);
+        assert_eq!(after.current_hash, original.current_hash);
+
+        // Correction is a distinct appended entry referencing the appeal.
+        let correction: AuditEntry = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AuditEntry(correction_id))
+            .unwrap();
+        assert_eq!(correction.action, symbol_short!("correct"));
+        assert_eq!(correction.previous_hash, original.current_hash);
+
+        // Chain remains valid with both records present.
+        assert!(verify_audit_chain(&env));
+        assert_eq!(get_audit_log_count(&env), 2);
+    }
 }
