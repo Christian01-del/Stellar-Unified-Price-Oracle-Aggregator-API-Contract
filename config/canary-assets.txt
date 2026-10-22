@@ -29,4 +29,39 @@
 #   - Risk review and sign-off recorded before the asset is added below.
 #   - An asset without every required field above MUST NOT enter this manifest.
 #
+# Launch-day canary asset sequence (issue #606)
+# ---------------------------------------------
+# Low-risk canary assets are enabled in stages before broad production
+# coverage. Each stage lists the assets enabled at that stage and the
+# measurable advance / pause / rollback criteria the operator applies. The
+# canary pipeline reads the STAGE markers to know which assets are live.
+#
+# Stage 0 - Baseline (no canary assets enabled)
+#   Advance: pipeline green on an empty manifest; oracle serving all feeds.
+#   Pause:   any feed unhealthy or pipeline red.
+#   Rollback: n/a (nothing enabled).
+#
+# Stage 1 - Single low-risk canary asset
+#   Advance: >= 24h with zero stale-price alerts, feed deviation within
+#            tolerance, and no failed oracle updates for the canary asset.
+#   Pause:   any stale-price alert, deviation breach, or failed update;
+#            hold at Stage 1 until a clean 24h window is observed.
+#   Rollback: remove the Stage 1 asset from this manifest and redeploy.
+#
+# Stage 2 - Small canary set (2-3 low-risk assets)
+#   Advance: >= 48h clean across the Stage 2 set with the same thresholds
+#            as Stage 1, plus a successful recovery drill (feed outage /
+#            stale price) for at least one canary asset.
+#   Pause:   any alert or deviation breach; hold until a clean 48h window.
+#   Rollback: revert to the Stage 1 manifest and redeploy.
+#
+# Stage 3 - Broad production coverage
+#   Advance: >= 72h clean across the full manifest and all recovery drills
+#            passed; sign-off recorded per the policy above.
+#   Pause:   any alert, deviation breach, or failed drill; hold at Stage 2.
+#   Rollback: revert to the Stage 2 manifest and redeploy.
+#
 # Format: one asset contract id per line, compared by the canary pipeline.
+# Lines beginning with '#' are comments; STAGE markers are informational.
+#
+# STAGE 0
