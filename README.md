@@ -141,6 +141,51 @@ The generated `source-coverage-review.md` artifact contains a summary table. Ass
 threshold are marked `⚠️ BELOW THRESHOLD` with their assigned owner so the on-call operator can
 follow up. When no assets are below the threshold, the review reports a clean pass.
 
+## Provider Contract & Dependency Inventory
+
+Every production source has a recorded upstream provider contract so an operator can identify
+its dependency, terms, limits, and fallback. The inventory lives in
+`config/provider-inventory.json` and is validated by the `provider-inventory` check
+(`.github/workflows/provider-inventory.yml`), which runs on every PR that touches the file and
+on a weekly schedule.
+
+### Inventory schema
+
+```json
+{
+  "sources": [
+    {
+      "source": "GBBB...",
+      "name": "Chainlink",
+      "provider": "Chainlink Labs",
+      "endpoint": "https://...",
+      "terms_url": "https://...",
+      "rate_limit": "60 req/min",
+      "dependencies": ["stellar-rpc", "chainlink-node"],
+      "fallback": "GBCC...",
+      "replacement_contact": "@oracle-ops"
+    }
+  ]
+}
+```
+
+Required fields per source: `source`, `name`, `provider`, `terms_url`, `rate_limit`,
+`dependencies`, `fallback`, and `replacement_contact`. The check fails if any production source
+is missing a field, references an unregistered fallback, or contains a value that looks like a
+secret (e.g. API keys or bearer tokens).
+
+### Operator workflow
+
+1. When onboarding a source, add its entry to `config/provider-inventory.json` in the same PR
+   that calls `add_source`.
+2. When a provider changes terms, limits, or contacts, update the entry and note the change in
+   the PR description.
+3. When a provider is deprecated, set `fallback` to the replacement source and update
+   `replacement_contact` before removing the old source.
+
+No credentials, API keys, or tokens are stored in the inventory — only public contract metadata
+and contact handles.
+
 ## oracle-cli
 
 `scripts/oracle-cli.sh` is a shell script plugin that wraps `stellar contract invoke` with
@@ -190,70 +235,4 @@ export ORACLE_NETWORK=testnet        # default: testnet
 # Query latest price
 ./scripts/oracle-cli.sh get-price --asset GCCC...
 
-# Health check
-./scripts/oracle-cli.sh health-check
-```
-
-## Getting Started
-
-### Prerequisites
-
-- Rust (stable toolchain, see `rust-toolchain.toml`)
-- Soroban CLI (optional, for deployment)
-
-### Build
-
-```bash
-make build
-```
-
-### Test
-
-```bash
-make test
-```
-
-All **79 tests pass** with zero warnings.
-
-### End-to-End Testnet Test
-
-Deploys the contract to Stellar testnet and runs a full lifecycle test:
-
-```bash
-./scripts/e2e-testnet.sh
-```
-
-See [docs/e2e-testnet.md](docs/e2e-testnet.md) for prerequisites, configuration, and expected output.
-
-Automated testnet lifecycle CI (with adversarial phases) runs via `scripts/testnet-lifecycle.sh`; see `.github/workflows/testnet-lifecycle.yml`.
-
-Related reports: [gas cost dashboard](docs/gas-dashboard.md), [chaos invariants](docs/chaos-invariants.md), and mutation testing (`scripts/mutation-gate.sh`, config in `.cargo/mutants.toml`).
-
-### Deploy
-
-```bash
-soroban contract deploy \
-  --wasm target/wasm32v1-none/release/price_oracle.wasm \
-  --source <identity> \
-  --network testnet
-```
-
-## Project Structure
-
-```
-contracts/price-oracle/
-├── Cargo.toml
-├── .cargo/config.toml
-└── src/
-    ├── lib.rs       # Contract entrypoint and endpoint implementations
-    ├── types.rs     # Data types, storage keys, error codes
-    ├── storage.rs   # Storage helpers and median computation
-    ├── events.rs    # Contract event definitions
-    └── test.rs      # Test suite (65 tests)
-```
-
-## Tech Stack
-
-| Layer | Technology |
-|-------|-----------|
-| Contract | Rust, Soroban SDK v26 |
+# Health 
