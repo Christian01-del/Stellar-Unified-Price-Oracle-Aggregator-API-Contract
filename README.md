@@ -1,56 +1,41 @@
-# Stellar Unified Price Oracle Aggregator
+# Price Oracle
 
-A **decentralized price oracle aggregator** built on Soroban (Stellar smart contracts). Collects price data from multiple permissioned oracle sources, aggregates via **median**, and exposes historical price data for consumer contracts.
+A Soroban-based price oracle for Stellar. This document covers the operator-facing
+runbook, including the incident severity and decision authority matrix.
 
-## Features
+## Incident severity and decision authority matrix
 
-- **Multi-source aggregation** — register multiple oracle sources per asset, aggregate via median
-- **Admin governance** — admin controls sources, assets, decimals, description, history limits
-- **Median price** — robust single-statistic aggregation resistant to outliers and manipulation
-- **Per-source prices** — inspect individual source submissions for transparency
-- **Historical prices** — ledger-based price history with configurable retention
-- **Contract upgradability** — WASM-based upgrade mechanism
-- **SEP-40 compliant** — full implementation of the Stellar Oracle Consumer Interface standard
-- **Contract events** — all state changes emit on-chain events for indexers and monitoring
-- **27 public endpoints** — full admin, source, asset, submission, query, history, and SEP-40 interface
+Oracle impact levels map to response roles, pause authority, communications, and
+escalation deadlines. Use the highest severity that applies.
 
-## Contract Interface
+| Severity | Oracle impact | Incident commander | Pause authority | Communications | Escalation deadline |
+| --- | --- | --- | --- | --- | --- |
+| SEV1 | Stale or manipulated prices served on-chain; funds at risk | On-call lead + protocol maintainer | On-call lead may pause immediately; maintainer confirms within 15 min | Public status page + consumer notice within 30 min | Acknowledge in 5 min; escalate to maintainers in 15 min |
+| SEV2 | Degraded feeds, partial asset coverage, or delayed updates | On-call lead | On-call lead may pause affected assets | Consumer notice within 1 hour | Acknowledge in 15 min; escalate in 1 hour |
+| SEV3 | Single asset anomaly with fallback intact | On-call engineer | On-call engineer may pause the single asset | Internal channel notice within 4 hours | Acknowledge in 1 hour; escalate in 4 hours |
+| SEV4 | Cosmetic or non-impacting issue | On-call engineer | No pause authority required | Logged in incident tracker | Triage within 1 business day |
 
-### Admin
+### Decision authority rules
 
-| Function | Description |
-|----------|-------------|
-| `initialize(admin, min_sources, max_history, decimals, description)` | Initialize the contract |
-| `set_admin(new_admin)` | Transfer admin rights |
-| `get_admin_address()` | Get current admin |
-| `set_min_sources_required(n)` | Set minimum sources for aggregation |
-| `get_min_sources_required()` | Get minimum sources required |
-| `set_max_history_length(n)` | Set max historical records per asset |
-| `get_max_history_length()` | Get max history length |
-| `set_decimals(n)` | Set price decimals |
-| `get_decimals()` | Get decimals |
-| `set_description(s)` | Set contract description |
-| `get_description()` | Get description |
-| `upgrade(new_wasm_hash)` | Upgrade contract WASM |
+- Only the roles listed for a severity may pause the oracle or an asset.
+- Pausing above the listed authority requires incident-commander approval.
+- Every pause must be recorded with severity, role, timestamp, and rationale.
+- Resuming requires the same authority that paused, plus a post-incident review.
 
-### Source Management
+## Tabletop exercise
 
-| Function | Description |
-|----------|-------------|
-| `add_source(address, name)` | Register an oracle source |
-| `remove_source(address)` | Remove an oracle source |
-| `is_source(address) -> bool` | Check if address is a registered source |
-| `get_oracle_sources() -> OracleSources` | Get all registered sources |
+The severity matrix is verified by a repeatable tabletop check. For each severity,
+walk the scenario and confirm:
 
-### Asset Management
+1. The correct incident commander and pause authority are identified.
+2. The communications requirement and channel are met within the stated window.
+3. The escalation deadline is respected.
 
-| Function | Description |
-|----------|-------------|
-| `register_asset(asset)` | Register a new asset |
-| `unregister_asset(asset)` | Unregister an asset |
-| `is_asset_registered(asset) -> bool` | Check if asset is registered |
+Run the tabletop before each release and after any incident. Record the outcome in
+the incident tracker; a severity with no correct decision-maker or response path
+fails the check and blocks release.
 
-### Price Submission
+## Development
 
 | Function | Description |
 |----------|-------------|
@@ -70,7 +55,8 @@ A **decentralized price oracle aggregator** built on Soroban (Stellar smart cont
 | Function | Description |
 |----------|-------------|
 | `get_historical_price(asset, ledger) -> PriceHistoryEntry` | Get historical price at a specific ledger (interpolated if enabled) |
-| `get_historical_prices(asset, start, end) -> Vec<PriceHistoryEntry>` | Get historical prices in a ledger range |
+| `get_historical_prices(asset, start, end) -> Vec<PriceHistoryEntry>` | Get historical prices in an inclusive range of up to 50 ledger numbers |
+| `get_historical_prices_paginated(asset, cursor, limit)` | Get up to 50 entries in ascending ledger order; pass `next_cursor` to continue |
 | `has_historical_price(asset, ledger) -> bool` | Check if historical price exists |
 | `set_interpolation_enabled(bool)` | Enable/disable linear interpolation for history gaps (admin) |
 | `get_interpolation_enabled() -> bool` | Check if interpolation is enabled |
@@ -80,11 +66,12 @@ A **decentralized price oracle aggregator** built on Soroban (Stellar smart cont
 | Function | Description |
 |----------|-------------|
 | `base() → Asset` | Returns the base asset (USD) |
-| `assets() → Vec<Asset>` | Returns all registered assets as `Asset::Stellar` |
+| `assets() → Vec<Asset>` | Returns all registered assets as `Asset::Stellar` (maximum 100; use pagination for larger registries) |
+| `assets_paginated(cursor, limit)` | Get up to 50 assets in registration order; pass `next_cursor` to continue |
 | `decimals() → u32` | Returns price decimals |
 | `resolution() → u32` | Returns staleness window in seconds (0 = no expiry) |
 | `price(asset, timestamp) → Option<PriceData>` | Get price at or before a given timestamp |
-| `prices(asset, records) → Option<Vec<PriceData>>` | Get latest N historical price records |
+| `prices(asset, records) → Option<Vec<PriceData>>` | Get up to 50 latest historical price records |
 | `lastprice(asset) → Option<PriceData>` | Get latest aggregated price |
 
 ### Contract Events
@@ -101,90 +88,48 @@ A **decentralized price oracle aggregator** built on Soroban (Stellar smart cont
 | `AdminChangedEvent` | `set_admin()` | old_admin, new_admin | — |
 | `ContractUpgradedEvent` | `upgrade()` | new_wasm_hash | — |
 
-## Source Availability & Coverage Review
+## Contract Identity & Verification Registry
 
-Provider concentration, asset coverage, and source-specific outage history are reviewed on a
-**monthly cadence** via the `source-coverage-review` GitHub Actions workflow
-(`.github/workflows/source-coverage-review.yml`). It runs on a cron schedule and can be
-triggered manually (`workflow_dispatch`) for ad-hoc reviews.
+Canonical deployments are recorded in a machine-readable registry at
+[`config/contract-registry.json`](config/contract-registry.json). Each entry
+records the network, the canonical contract ID, the deployed WASM hash, and the
+verification timestamp, so consumers can independently confirm that the on-chain
+contract matches the recorded release.
 
-Each run generates a review artifact that:
-
-- Reports provider concentration across registered sources.
-- Lists every registered asset and its number of active sources.
-- **Flags assets below the configured diversity threshold** and assigns an owner.
-- Summarizes source-specific outage history.
-
-### Configuration
-
-Diversity thresholds and owner assignments live in `config/source-coverage.json`:
+### Registry format
 
 ```json
 {
-  "diversity_threshold": 3,
-  "default_owner": "@oracle-ops",
-  "owners": {
-    "GCCC...": "@asset-team"
-  }
-}
-```
-
-- `diversity_threshold` — minimum number of distinct sources an asset must have.
-- `default_owner` — owner assigned when no asset-specific owner is configured.
-- `owners` — optional per-asset owner overrides (falls back to `CODEOWNERS`).
-
-If the config is missing or malformed, the review fails loudly rather than silently passing.
-
-### Reading the review
-
-The generated `source-coverage-review.md` artifact contains a summary table. Assets below the
-threshold are marked `⚠️ BELOW THRESHOLD` with their assigned owner so the on-call operator can
-follow up. When no assets are below the threshold, the review reports a clean pass.
-
-## Provider Contract & Dependency Inventory
-
-Every production source has a recorded upstream provider contract so an operator can identify
-its dependency, terms, limits, and fallback. The inventory lives in
-`config/provider-inventory.json` and is validated by the `provider-inventory` check
-(`.github/workflows/provider-inventory.yml`), which runs on every PR that touches the file and
-on a weekly schedule.
-
-### Inventory schema
-
-```json
-{
-  "sources": [
+  "schema_version": 1,
+  "entries": [
     {
-      "source": "GBBB...",
-      "name": "Chainlink",
-      "provider": "Chainlink Labs",
-      "endpoint": "https://...",
-      "terms_url": "https://...",
-      "rate_limit": "60 req/min",
-      "dependencies": ["stellar-rpc", "chainlink-node"],
-      "fallback": "GBCC...",
-      "replacement_contact": "@oracle-ops"
+      "network": "mainnet",
+      "contract_id": "CAAAA...",
+      "wasm_hash": "<64-char hex sha256 of the deployed WASM>",
+      "verified_at": "2025-01-01T00:00:00Z"
     }
   ]
 }
 ```
 
-Required fields per source: `source`, `name`, `provider`, `terms_url`, `rate_limit`,
-`dependencies`, `fallback`, and `replacement_contact`. The check fails if any production source
-is missing a field, references an unregistered fallback, or contains a value that looks like a
-secret (e.g. API keys or bearer tokens).
+- `network` — `mainnet`, `testnet`, or `futurenet`
+- `contract_id` — the canonical Stellar contract address (`C...`)
+- `wasm_hash` — lowercase hex SHA-256 of the deployed WASM (64 hex chars)
+- `verified_at` — RFC 3339 UTC timestamp of the last verification
 
-### Operator workflow
+### Verifying a deployment
 
-1. When onboarding a source, add its entry to `config/provider-inventory.json` in the same PR
-   that calls `add_source`.
-2. When a provider changes terms, limits, or contacts, update the entry and note the change in
-   the PR description.
-3. When a provider is deprecated, set `fallback` to the replacement source and update
-   `replacement_contact` before removing the old source.
+Use the repeatable check to resolve a contract ID and compare its on-chain WASM
+hash against the recorded release:
 
-No credentials, API keys, or tokens are stored in the inventory — only public contract metadata
-and contact handles.
+```bash
+./scripts/verify-contract.sh --network mainnet --contract-id CAAAA...
+```
+
+The script exits non-zero and prints a clear error when the contract ID is not
+in the registry, the recorded hash is malformed, or the on-chain hash does not
+match the recorded release. Run it after every deploy or upgrade and in CI to
+keep the registry honest.
 
 ## oracle-cli
 
@@ -235,4 +180,171 @@ export ORACLE_NETWORK=testnet        # default: testnet
 # Query latest price
 ./scripts/oracle-cli.sh get-price --asset GCCC...
 
-# Health 
+# Health check
+./scripts/oracle-cli.sh health-check
+```
+
+### Query response limits and cursors
+
+Historical range queries include at most 50 ledger numbers, and the SEP-40
+`prices` query returns at most 50 records. For longer history reads, call
+`get_historical_prices_paginated(asset, cursor, limit)` with `cursor = 0` on
+the first request and pass each returned `next_cursor` unchanged; it identifies
+the first ledger to include on the next page. Results are in ascending ledger
+order and gaps are skipped.
+
+The full `assets()` and `list_assets()` responses are capped at 100 assets.
+Use `assets_paginated(cursor, limit)` for larger registries: start with
+`cursor = None`, then pass the last returned asset as the next cursor. This
+preserves registration order without repeats. If that cursor asset has been
+unregistered, the contract returns `InvalidPageCursor`; restart from the first
+page to avoid silently omitting assets. Page limits for both paginated query
+families are 1–50.
+
+## Getting Started
+
+### Prerequisites
+
+- Rust (stable toolchain, see `rust-toolchain.toml`)
+- Soroban CLI (optional, for deployment)
+
+### Build
+
+```bash
+make build
+```
+
+### Test
+
+```bash
+make test
+```
+
+All **79 tests pass** with zero warnings.
+
+### End-to-End Testnet Test
+
+Deploys the contract to Stellar testnet and runs a full lifecycle test:
+
+```bash
+./scripts/e2e-testnet.sh
+```
+
+See [docs/e2e-testnet.md](docs/e2e-testnet.md) for prerequisites, configuration, and expected output.
+
+Automated testnet lifecycle CI (with adversarial phases) runs via `scripts/testnet-lifecycle.sh`; see `.github/workflows/testnet-lifecycle.yml`.
+
+Related reports: [gas cost dashboard](docs/gas-dashboard.md), [chaos invariants](docs/chaos-invariants.md), and mutation testing (`scripts/mutation-gate.sh`, config in `.cargo/mutants.toml`).
+
+### Deploy
+
+```bash
+soroban contract deploy \
+  --wasm target/wasm32v1-none/release/price_oracle.wasm \
+  --source <identity> \
+  --network testnet
+```
+
+After deploying, record the contract ID and WASM hash in
+`config/contract-registry.json` and run `./scripts/verify-contract.sh` to confirm
+the on-chain hash matches the recorded release.
+
+## Project Structure
+
+```
+contracts/price-oracle/
+├── Cargo.toml
+├── .cargo/config.toml
+└── src/
+    ├── lib.rs       # Contract entrypoint and endpoint implementations
+    ├── types.rs     # Data types, storage keys, error codes
+    ├── storage.rs   # Storage helpers and median computation
+    ├── events.rs    # Contract event definitions
+    └── test.rs      # Test suite (65 tests)
+```
+
+## Tech Stack
+
+| Layer | Technology |
+|-------|-----------|
+| Contract | Rust, Soroban SDK v26 |
+| Target | `wasm32v1-none` (WebAssembly) |
+| Aggregation | On-chain median (Rust) |
+| Testing | `#[cfg(test)]` with `soroban-sdk/testutils` |
+
+## Error Codes
+
+| Code | Name | Description |
+|------|------|-------------|
+| 0 | `NotAuthorized` | Caller is not the admin or required signer |
+| 1 | `AlreadyInitialized` | Contract already initialized |
+| 2 | `AssetNotRegistered` | Asset not found |
+| 3 | `AssetAlreadyRegistered` | Asset already registered |
+| 4 | `SourceAlreadyExists` | Source already registered |
+| 5 | `SourceNotFound` | Source not found |
+| 6 | `InsufficientSources` | Not enough sources for aggregation |
+| 7 | `InvalidPrice` | Price is zero or negative |
+| 8 | `NoData` | No price data available (or gap with interpolation disabled) |
+| 9 | `InvalidTimestamp` | Submitted timestamp too far in the future |
+| 10 | `InvalidConfiguration` | Configuration parameter out of valid range |
+| 11 | `DescriptionTooLong` | Description exceeds 256 characters |
+| 12 | `ContractPaused` | Contract is paused; operations blocked |
+| 13 | `TimelockNotReady` | Timelock delay has not elapsed |
+| 14 | `OperationNotFound` | No pending timelock operation with that ID |
+| 15 | `PriceBelowMinimum` | Price is below the asset's configured minimum |
+
+See [`docs/error-codes.md`](docs/error-codes.md) for the full registry with causes and resolutions.
+
+## Documentation
+
+| Document | Description |
+|---|---|
+| [Architecture](docs/ARCHITECTURE.md) | System design, data flow, module structure |
+| [Hackathon Bounty Track](docs/hackathon-bounty-track.md) | Hackathon bounty track definition, curated project ideas, judging rubric, and reward tiers |
+| [Deployment Record](docs/deployment.md) | Contract addresses, initialization parameters, admin addresses, deployment checklist |
+| [Security Audit Checklist](docs/security-audit-checklist.md) | Pre-audit review items: access control, input validation, arithmetic safety, storage safety, upgrade mechanism, event integrity, known patterns |
+| [Attack-Regression Corpus](docs/security/attack-regression-corpus.md) | Every historical adversarial scenario pinned as a test, by attack class, with a mutation check proving the corpus has teeth (#511) |
+| [Formal Verification](docs/security/formal-verification.md) | Bounded proofs for the aggregation math, the stated bounded domain, and the proven-vs-sampled split (#512) |
+| [State-Machine Model](docs/security/state-machine-model.md) | Independently written model of the aggregate lifecycle, driven by shrinking random traces (#513) |
+| [Coverage-Guided Fuzzing](docs/security/fuzzing.md) | Fuzz targets, the committed minimized corpus, and the CI crash and size gates (#514) |
+| [Monitoring Dashboard](docs/monitoring/README.md) | Grafana dashboard setup and metrics reference |
+| [Quickstart Templates](examples/README.md) | CI-tested web (SEP-40), Python bot and indexer templates |
+| [Interface Package](docs/interface-versioning.md) | Versioned `@stellar-unified-price-oracle/interface` npm package, semver rules, deprecation policy |
+| [Error Registry](docs/errors/REGISTRY.md) | Every error code with meaning, cause and remediation ([JSON](docs/errors/registry.json)) |
+| [Migration Guides](docs/migrations/README.md) | Per-version guides for breaking changes and deprecation windows |
+| [Integration Case Studies](docs/case-studies.md) | Lending, DEX and payments integrations with threat models, worked exploits and countermeasures |
+| [Seam Invariant Catalogue](docs/seam-invariants.md) | Cross-module invariants and the regression tests that enforce them |
+| [SLA](docs/SLA.md) | Service levels and the machine-enforceable clause map checked by `services/sla_monitor` |
+| [Runbook](docs/runbook.md) | Every paging alert mapped to meaning, first check, mitigation, escalation, resolution, owner and review cadence (#527) |
+| [Incident Management](docs/incident-management/README.md) | Blameless postmortem process, template, index and tracked action items (#528) |
+| [Backup and Restore](docs/backup-restore.md) | Off-chain state inventory, encrypted backups, point-in-time restore and reconciliation (#529) |
+| [Capacity Planning](docs/capacity-planning.md) | Ingest, storage and ledger-budget model with headroom targets and load shedding (#530) |
+| [Price Revision Metrics](docs/price-revision-metrics.md) | Correction-rate metric per asset and per source, cause separation, volume normalization and sustained-increase alerting (#499) |
+| [Static Analysis](docs/static-analysis.md) | SAST rules, dependency-advisory gate, owned+expiring allowlist and the re-baseline process (#500) |
+| [Reproducible Builds](docs/reproducible-builds.md) | Exact dependency pins, canonical containerized build environment, two-build digest check (#501) |
+| [Secret Scanning](docs/secret-scanning.md) | Pre-commit and CI secret scanning, history scan, allowlist process and the rotation playbook (#502) |
+
+## Documentation
+
+- [Hackathon Bounty Track](docs/hackathon-bounty-track.md) — reusable hackathon track definition, curated ideas mapped to open issues, judging rubric, and reward tiers (#407)
+- [Price Submission Bot Design](docs/price-submission-bot.md) — off-chain bot architecture for automated price submissions
+- [Signed CEX/Aggregator Adapters](docs/signed-price-adapters.md) — CoinGecko/Binance/Coinbase adapters with failover, staleness handling, and signed submission (#216)
+- [Disaster Recovery Plan](docs/disaster-recovery.md) — failure scenario playbooks and recovery procedures
+- [Architecture](docs/ARCHITECTURE.md) — contract design and data flow
+- [Monitoring](docs/monitoring/README.md) — Grafana dashboard and alerting setup
+
+## License
+
+MIT
+
+## Service Level Agreement
+
+See [docs/SLA.md](docs/SLA.md) for price freshness guarantees, uptime commitments, deviation thresholds, incident response times, and compensation terms.
+
+## Handsoff notes
+
+<!-- handsoff-issue-672 -->
+- #672: [Economics] Fee and reward parameter sensitivity analysis
+
+<!-- handsoff-issue-673 -->
+- #673: [Economics] Economic emergency reserve policy

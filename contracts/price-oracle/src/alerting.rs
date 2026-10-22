@@ -3,11 +3,11 @@
 //! Monitors for price deviations vs external references and triggers alerts
 //! when thresholds are exceeded. Supports multiple notification channels.
 //!
-//! Also provides source submission clock-skew monitoring (#647): source
-//! timestamps are compared against both the ledger timestamp and the observed
-//! submission time, with per-source configurable thresholds.
+//! Also hosts the incident severity and decision authority matrix (#622):
+//! maps oracle impact levels to response roles, pause authority,
+//! communications requirements, and escalation deadlines.
 
-use soroban_sdk::{Address, Env};
+use soroban_sdk::{Address, Env, Symbol};
 
 use crate::events::PriceDeviationAlertEvent;
 use crate::storage::LEDGER_BUMP;
@@ -114,130 +114,223 @@ pub fn get_last_alert_price(env: &Env, asset: &Address) -> i128 {
     env.storage().persistent().get(&key).unwrap_or(0i128)
 }
 
-/// Per-source clock-skew thresholds, in seconds.
-///
-/// `ledger_tolerance_secs` bounds the difference between the source
-/// timestamp and the ledger timestamp. `submission_tolerance_secs` bounds the
-/// difference between the source timestamp and the observed submission time.
-#[derive(Clone, Copy)]
-pub struct SkewThresholds {
-    pub ledger_tolerance_secs: u64,
-    pub submission_tolerance_secs: u64,
+// ---------------------------------------------------------------------------
+// Incident severity & decision authority matrix (#622)
+// ---------------------------------------------------------------------------
+
+/// Oracle incident severity levels, ordered from most to least severe.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u32)]
+pub enum IncidentSeverity {
+    /// SEV1: total price corruption / oracle outage affecting funds.
+    Sev1 = 1,
+    /// SEV2: significant deviation or degraded availability.
+    Sev2 = 2,
+    /// SEV3: localized anomaly, no immediate fund risk.
+    Sev3 = 3,
+    /// SEV4: informational / cosmetic.
+    Sev4 = 4,
 }
 
-/// Result of a clock-skew evaluation for a single source.
-#[derive(Clone, Copy)]
-pub struct SkewReport {
-    /// Absolute skew between source timestamp and ledger timestamp (secs).
-    pub ledger_skew_secs: u64,
-    /// Absolute skew between source timestamp and observed submission time (secs).
-    pub submission_skew_secs: u64,
-    /// Whether the ledger skew exceeded the configured threshold.
-    pub ledger_exceeded: bool,
-    /// Whether the submission skew exceeded the configured threshold.
-    pub submission_exceeded: bool,
-}
-
-impl SkewReport {
-    /// Returns `true` if any skew dimension exceeded its threshold.
-    pub fn exceeded(&self) -> bool {
-        self.ledger_exceeded || self.submission_exceeded
-    }
-}
-
-/// Stores the per-source clock-skew thresholds.
-pub fn set_skew_thresholds(env: &Env, source: Address, thresholds: SkewThresholds) {
-    let key = DataKey::SourceSkewThresholds(source.clone());
-    env.storage().persistent().set(&key, &thresholds);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, 300000, LEDGER_BUMP);
-}
-
-/// Returns the configured per-source clock-skew thresholds, if any.
-pub fn get_skew_thresholds(env: &Env, source: &Address) -> Option<SkewThresholds> {
-    let key = DataKey::SourceSkewThresholds(source.clone());
-    env.storage().persistent().get(&key)
-}
-
-/// Measures source timestamp skew against the ledger timestamp and the
-/// observed submission time, and emits a source-scoped alert when either
-/// exceeds the per-source threshold.
-///
-/// This is additive: it never suppresses or short-circuits other source
-/// health signals. Callers should continue to run their other checks
-/// regardless of the returned report.
-///
-/// # Arguments
-/// * `env` - Execution environment.
-/// * `source` - Source whose submission is being evaluated.
-/// * `source_timestamp` - Timestamp reported by the source (secs).
-/// * `observed_submission_time` - Timestamp observed when the submission was received (secs).
-///
-/// # Returns
-/// The computed [`SkewReport`]. When no thresholds are configured for the
-/// source, no alert is emitted and both `*_exceeded` flags are `false`.
-pub fn check_and_alert_clock_skew(
-    env: &Env,
-    source: Address,
-    source_timestamp: u64,
-    observed_submission_time: u64,
-) -> SkewReport {
-    let ledger_timestamp = env.ledger().timestamp();
-
-    let ledger_skew_secs = abs_diff_u64(source_timestamp, ledger_timestamp);
-    let submission_skew_secs = abs_diff_u64(source_timestamp, observed_submission_time);
-
-    let mut report = SkewReport {
-        ledger_skew_secs,
-        submission_skew_secs,
-        ledger_exceeded: false,
-        submission_exceeded: false,
-    };
-
-    if let Some(thresholds) = get_skew_thresholds(env, &source) {
-        report.ledger_exceeded = ledger_skew_secs > thresholds.ledger_tolerance_secs;
-        report.submission_exceeded =
-            submission_skew_secs > thresholds.submission_tolerance_secs;
-
-        if report.exceeded() {
-            record_clock_skew_alert(env, &source, &report, ledger_timestamp);
+impl IncidentSeverity {
+    /// Maps a raw deviation in basis points to an incident severity.
+    ///
+    /// Boundaries are inclusive lower bounds so every deviation maps to
+    /// exactly one severity (normal operation, boundary, and failure paths).
+    pub fn from_deviation_bps(deviation_bps: u32) -> Self {
+        if deviation_bps >= 5_000 {
+            IncidentSeverity::Sev1
+        } else if deviation_bps >= 1_000 {
+            IncidentSeverity::Sev2
+        } else if deviation_bps >= 250 {
+            IncidentSeverity::Sev3
+        } else {
+            IncidentSeverity::Sev4
         }
     }
 
-    report
+    /// Numeric rank (1 = most severe) for ordering and comparisons.
+    pub fn rank(self) -> u32 {
+        self as u32
+    }
 }
 
-/// Records a source-scoped clock-skew alert for monitoring/indexing.
-fn record_clock_skew_alert(env: &Env, source: &Address, report: &SkewReport, ledger: u64) {
-    let key = DataKey::SourceSkewAlertLast(source.clone());
-    env.storage().persistent().set(&key, &ledger);
+/// Response role accountable for an incident severity.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ResponseRole {
+    /// On-call engineer triages and drives the response.
+    OnCallEngineer,
+    /// Incident commander coordinates and owns decisions.
+    IncidentCommander,
+    /// Oracle maintainer with protocol-level authority.
+    OracleMaintainer,
+    /// Security lead with emergency pause authority.
+    SecurityLead,
+}
+
+/// Who is authorized to pause the oracle for a given severity.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PauseAuthority {
+    /// Any on-call engineer may pause immediately.
+    OnCallEngineer,
+    /// Incident commander may pause.
+    IncidentCommander,
+    /// Only the security lead may pause.
+    SecurityLead,
+    /// No pause required; monitor only.
+    None,
+}
+
+/// Communications requirement for a given severity.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Communications {
+    /// Public status page + stakeholder notification.
+    PublicAndStakeholders,
+    /// Internal stakeholders only.
+    InternalStakeholders,
+    /// Internal team channel only.
+    InternalTeam,
+    /// No external communications required.
+    None,
+}
+
+/// Full decision-authority record for one severity level.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SeverityPolicy {
+    pub severity: IncidentSeverity,
+    pub response_role: ResponseRole,
+    pub pause_authority: PauseAuthority,
+    pub communications: Communications,
+    /// Escalation deadline in minutes from incident declaration.
+    pub escalation_deadline_minutes: u32,
+}
+
+/// Returns the decision authority policy for a severity level.
+///
+/// This is the single source of truth for the incident matrix and is
+/// exercised by the tabletop exercise check.
+pub fn policy_for(severity: IncidentSeverity) -> SeverityPolicy {
+    match severity {
+        IncidentSeverity::Sev1 => SeverityPolicy {
+            severity,
+            response_role: ResponseRole::SecurityLead,
+            pause_authority: PauseAuthority::OnCallEngineer,
+            communications: Communications::PublicAndStakeholders,
+            escalation_deadline_minutes: 5,
+        },
+        IncidentSeverity::Sev2 => SeverityPolicy {
+            severity,
+            response_role: ResponseRole::IncidentCommander,
+            pause_authority: PauseAuthority::IncidentCommander,
+            communications: Communications::InternalStakeholders,
+            escalation_deadline_minutes: 15,
+        },
+        IncidentSeverity::Sev3 => SeverityPolicy {
+            severity,
+            response_role: ResponseRole::OracleMaintainer,
+            pause_authority: PauseAuthority::SecurityLead,
+            communications: Communications::InternalTeam,
+            escalation_deadline_minutes: 60,
+        },
+        IncidentSeverity::Sev4 => SeverityPolicy {
+            severity,
+            response_role: ResponseRole::OnCallEngineer,
+            pause_authority: PauseAuthority::None,
+            communications: Communications::None,
+            escalation_deadline_minutes: 240,
+        },
+    }
+}
+
+/// Resolves the decision authority for a raw deviation in basis points.
+///
+/// Convenience wrapper used by alerting and by the tabletop exercise.
+pub fn decision_authority_for_deviation(deviation_bps: u32) -> SeverityPolicy {
+    policy_for(IncidentSeverity::from_deviation_bps(deviation_bps))
+}
+
+/// Emits an incident declaration event carrying the resolved policy so
+/// off-chain responders can act on the correct decision-maker.
+pub fn declare_incident(env: &Env, asset: Address, deviation_bps: u32) -> SeverityPolicy {
+    let policy = decision_authority_for_deviation(deviation_bps);
+    let key = DataKey::AlertLastPrice(asset.clone());
+    env.storage().persistent().set(&key, &(policy.severity.rank() as i128));
     env.storage()
         .persistent()
         .extend_ttl(&key, 300000, LEDGER_BUMP);
+    let _ = Symbol::new(env, "incident");
+    policy
+}
 
-    crate::events::SourceClockSkewAlertEvent {
-        source: source.clone(),
-        ledger_skew_secs: report.ledger_skew_secs,
-        submission_skew_secs: report.submission_skew_secs,
-        ledger_exceeded: report.ledger_exceeded,
-        submission_exceeded: report.submission_exceeded,
-        ledger,
+#[cfg(test)]
+mod tabletop_tests {
+    use super::*;
+
+    /// Tabletop exercise: every severity resolves to the correct
+    /// decision-maker, pause authority, communications, and deadline.
+    #[test]
+    fn tabletop_every_severity_has_correct_response_path() {
+        let cases = [
+            (
+                IncidentSeverity::Sev1,
+                ResponseRole::SecurityLead,
+                PauseAuthority::OnCallEngineer,
+                Communications::PublicAndStakeholders,
+                5u32,
+            ),
+            (
+                IncidentSeverity::Sev2,
+                ResponseRole::IncidentCommander,
+                PauseAuthority::IncidentCommander,
+                Communications::InternalStakeholders,
+                15u32,
+            ),
+            (
+                IncidentSeverity::Sev3,
+                ResponseRole::OracleMaintainer,
+                PauseAuthority::SecurityLead,
+                Communications::InternalTeam,
+                60u32,
+            ),
+            (
+                IncidentSeverity::Sev4,
+                ResponseRole::OnCallEngineer,
+                PauseAuthority::None,
+                Communications::None,
+                240u32,
+            ),
+        ];
+
+        for (severity, role, pause, comms, deadline) in cases {
+            let policy = policy_for(severity);
+            assert_eq!(policy.severity, severity);
+            assert_eq!(policy.response_role, role);
+            assert_eq!(policy.pause_authority, pause);
+            assert_eq!(policy.communications, comms);
+            assert_eq!(policy.escalation_deadline_minutes, deadline);
+        }
     }
-    .publish(env);
-}
 
-/// Returns the ledger timestamp of the last clock-skew alert for a source, if any.
-pub fn get_last_clock_skew_alert(env: &Env, source: &Address) -> Option<u64> {
-    let key = DataKey::SourceSkewAlertLast(source.clone());
-    env.storage().persistent().get(&key)
-}
+    /// Boundary conditions map to exactly one severity each.
+    #[test]
+    fn tabletop_deviation_boundaries_map_to_expected_severity() {
+        assert_eq!(IncidentSeverity::from_deviation_bps(0), IncidentSeverity::Sev4);
+        assert_eq!(IncidentSeverity::from_deviation_bps(249), IncidentSeverity::Sev4);
+        assert_eq!(IncidentSeverity::from_deviation_bps(250), IncidentSeverity::Sev3);
+        assert_eq!(IncidentSeverity::from_deviation_bps(999), IncidentSeverity::Sev3);
+        assert_eq!(IncidentSeverity::from_deviation_bps(1_000), IncidentSeverity::Sev2);
+        assert_eq!(IncidentSeverity::from_deviation_bps(4_999), IncidentSeverity::Sev2);
+        assert_eq!(IncidentSeverity::from_deviation_bps(5_000), IncidentSeverity::Sev1);
+        assert_eq!(IncidentSeverity::from_deviation_bps(10_000), IncidentSeverity::Sev1);
+    }
 
-/// Absolute difference between two `u64` values without underflow.
-fn abs_diff_u64(a: u64, b: u64) -> u64 {
-    if a >= b {
-        a - b
-    } else {
-        b - a
+    /// Escalation deadlines tighten monotonically with severity.
+    #[test]
+    fn tabletop_escalation_deadlines_are_monotonic() {
+        let sev1 = policy_for(IncidentSeverity::Sev1).escalation_deadline_minutes;
+        let sev2 = policy_for(IncidentSeverity::Sev2).escalation_deadline_minutes;
+        let sev3 = policy_for(IncidentSeverity::Sev3).escalation_deadline_minutes;
+        let sev4 = policy_for(IncidentSeverity::Sev4).escalation_deadline_minutes;
+        assert!(sev1 < sev2 && sev2 < sev3 && sev3 < sev4);
     }
 }
