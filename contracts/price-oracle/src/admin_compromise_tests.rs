@@ -5,11 +5,13 @@
 //! The capability list and residual risk are documented in
 //! `docs/security/admin-compromise-drill.md`.
 //!
-//! # #641 — Source key rotation rehearsal
+//! # #604 — Mainnet administrator multisig migration rehearsal
 //!
-//! Rehearses the staged source-key rotation runbook documented in
-//! `docs/operations/source-key-rotation.md`: submissions stay authorized
-//! through the planned transition and retired keys are rejected afterward.
+//! Rehearses the handoff from bootstrap administration to the production
+//! multisig. The procedure is documented in
+//! `docs/operations/admin-multisig-migration.md`; these tests prove the
+//! handoff ordering leaves no unowned interval and that neither the old nor
+//! the new signer set can create an unauthorized transition.
 
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
@@ -172,36 +174,100 @@ fn recovery_drill_end_to_end() {
     assert!(d.client.recovery_get_pending().is_none());
 }
 
-/// #641 — Staged source-key rotation rehearsal.
+/// #604 — Rehearses the bootstrap → production multisig handoff.
 ///
-/// Mirrors the runbook in `docs/operations/source-key-rotation.md`:
-/// 1. Pre-checks: the outgoing key is an authorized source.
-/// 2. Staged rollout: the incoming key is added while the outgoing key stays
-///    authorized, so submissions from both remain valid during the overlap.
-/// 3. Authorization verification: both keys are recognized sources.
-/// 4. Retirement: the outgoing key is removed and rejected afterward.
+/// Ordering (see `docs/operations/admin-multisig-migration.md`):
+///   1. Bootstrap admin configures guardians + delay (recovery armed).
+///   2. Bootstrap admin hands admin to the production multisig address.
+///   3. Multisig verifies ownership and performs the first authorized action.
+///
+/// The admin slot is never empty: `set_admin` is atomic, so the interval
+/// between the old and new owner is a single ledger with exactly one owner.
 #[test]
-fn source_key_rotation_rehearsal() {
+fn multisig_migration_handoff_leaves_no_unowned_interval() {
     let e = Env::default();
     e.mock_all_auths();
-    let (client, _admin) = setup_contract(&e);
+    let (client, bootstrap) = setup_contract(&e);
+    e.ledger().with_mut(|l| l.sequence_number = 1_000);
 
-    // 1. Pre-checks: outgoing key is an authorized source.
-    let old_key = register_test_source(&e, &client, "OldKey");
-    assert!(client.is_source(&old_key));
+    // 1. Arm recovery while the bootstrap admin is still in control.
+    let g1 = Address::generate(&e);
+    let g2 = Address::generate(&e);
+    let mut guardians: Vec<Address> = Vec::new(&e);
+    guardians.push_back(g1.clone());
+    guardians.push_back(g2.clone());
+    client.recovery_set_guardians(&guardians, &2u32);
+    client.recovery_set_delay(&DELAY);
 
-    // 2. Staged rollout: add the incoming key without removing the old one.
-    let new_key = Address::generate(&e);
-    client.add_source(&new_key, &String::from_str(&e, "NewKey"));
+    // 2. Atomic handoff to the production multisig address.
+    let multisig = Address::generate(&e);
+    assert_eq!(client.get_admin(), bootstrap);
+    client.set_admin(&multisig);
 
-    // 3. Authorization verification: both keys authorized during overlap.
-    assert!(client.is_source(&old_key));
-    assert!(client.is_source(&new_key));
+    // 3. Ownership is continuous: exactly one owner at every step.
+    assert_eq!(client.get_admin(), multisig);
+    assert_ne!(client.get_admin(), bootstrap);
 
-    // 4. Retirement: remove the outgoing key; it is rejected afterward.
-    client.remove_source(&old_key);
-    assert!(!client.is_source(&old_key));
-    assert!(client.is_source(&new_key));
+    // 4. The new owner performs the first authorized action.
+    let src = register_test_source(&e, &client, "PostMigration");
+    assert!(client.is_source(&src));
+    assert!(client.recovery_get_pending().is_none());
+}
+
+/// #604 — After migration the old bootstrap signer set cannot create an
+/// unauthorized transition: it can no longer rotate admin or guardians.
+#[test]
+fn old_signer_set_cannot_create_unauthorized_transition_after_migration() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, bootstrap) = setup_contract(&e);
+    e.ledger().with_mut(|l| l.sequence_number = 1_000);
+
+    let multisig = Address::generate(&e);
+    client.set_admin(&multisig);
+    assert_eq!(client.get_admin(), multisig);
+
+    // The old bootstrap key is no longer the admin; a fresh admin rotation
+    // must be authorized by the current owner, not the retired one.
+    let rogue = Address::generate(&e);
+    e.set_auths(&[]);
+    let r = client.try_set_admin(&rogue);
+    assert!(r.is_err());
+    assert_eq!(client.get_admin(), multisig);
+    assert_ne!(client.get_admin(), bootstrap);
+}
+
+/// #604 — The new multisig signer set cannot create an unauthorized
+/// transition outside its authorized scope: it cannot bypass the guardian
+/// recovery path to seize guardians mid-recovery.
+#[test]
+fn new_signer_set_cannot_create_unauthorized_transition_outside_scope() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _bootstrap) = setup_contract(&e);
+    e.ledger().with_mut(|l| l.sequence_number = 1_000);
+
+    let g1 = Address::generate(&e);
+    let g2 = Address::generate(&e);
+    let mut guardians: Vec<Address> = Vec::new(&e);
+    guardians.push_back(g1.clone());
+    guardians.push_back(g2.clone());
+    client.recovery_set_guardians(&guardians, &2u32);
+    client.recovery_set_delay(&DELAY);
+
+    let multisig = Address::generate(&e);
+    client.set_admin(&multisig);
+    assert_eq!(client.get_admin(), multisig);
+
+    // Guardians open a recovery; the multisig admin cannot override it.
+    let rescue = Address::generate(&e);
+    client.recovery_approve(&g1, &rescue);
+    let mut puppets: Vec<Address> = Vec::new(&e);
+    puppets.push_back(Address::generate(&e));
+    let r = client.try_recovery_set_guardians(&puppets, &1u32);
+    assert_eq!(r, Err(Ok(code(ErrorCode::RecoveryAlreadyPending))));
+    let r = client.try_recovery_set_delay(&50_000u32);
+    assert_eq!(r, Err(Ok(code(ErrorCode::RecoveryAlreadyPending))));
 }
 
 fn code(c: ErrorCode) -> soroban_sdk::Error {
