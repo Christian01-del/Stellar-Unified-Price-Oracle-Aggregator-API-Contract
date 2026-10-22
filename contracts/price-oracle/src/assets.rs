@@ -9,85 +9,7 @@ use crate::storage::{
 };
 use crate::types::{AssetMetadata, AssetMetadataUpdate, DataKey, ErrorCode, PriceBounds};
 
-/// Asset risk tier used to derive source diversity requirements.
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum AssetRiskTier {
-    /// Production / critical assets: strictest diversity requirements.
-    Critical = 0,
-    /// Standard production assets.
-    Standard = 1,
-    /// Lower-risk / test assets: minimal diversity requirements.
-    Low = 2,
-}
-
-impl AssetRiskTier {
-    pub fn from_u32(value: u32) -> Self {
-        match value {
-            0 => AssetRiskTier::Critical,
-            1 => AssetRiskTier::Standard,
-            _ => AssetRiskTier::Low,
-        }
-    }
-
-    /// Minimum number of independent providers required for this tier.
-    pub fn min_providers(self) -> u32 {
-        match self {
-            AssetRiskTier::Critical => 3,
-            AssetRiskTier::Standard => 2,
-            AssetRiskTier::Low => 1,
-        }
-    }
-
-    /// Minimum number of independent operators required for this tier.
-    pub fn min_operators(self) -> u32 {
-        match self {
-            AssetRiskTier::Critical => 2,
-            AssetRiskTier::Standard => 2,
-            AssetRiskTier::Low => 1,
-        }
-    }
-}
-
-/// Source configuration for an asset: the set of independent providers and
-/// operators backing its price feed.
-pub struct SourceDiversityConfig {
-    pub providers: Vec<Address>,
-    pub operators: Vec<Address>,
-}
-
-fn count_unique(env: &Env, addrs: &Vec<Address>) -> u32 {
-    let mut unique: Vec<Address> = Vec::new(env);
-    for i in 0..addrs.len() {
-        let a = addrs.get_unchecked(i);
-        let mut seen = false;
-        for j in 0..unique.len() {
-            if unique.get_unchecked(j) == a {
-                seen = true;
-                break;
-            }
-        }
-        if !seen {
-            unique.push_back(a);
-        }
-    }
-    unique.len()
-}
-
-/// Validate that a source configuration satisfies the diversity rule declared
-/// by the asset's risk tier. Panics with `InvalidConfiguration` when the
-/// configuration fails the rule.
-pub fn check_source_diversity(
-    env: &Env,
-    tier: AssetRiskTier,
-    config: &SourceDiversityConfig,
-) {
-    let providers = count_unique(env, &config.providers);
-    let operators = count_unique(env, &config.operators);
-    if providers < tier.min_providers() || operators < tier.min_operators() {
-        panic_with_error!(env, ErrorCode::InvalidConfiguration);
-    }
-}
+pub const MAX_ASSET_QUERY_SIZE: u32 = 100;
 
 pub fn register_asset(env: &Env, asset: Address) {
     let admin = get_admin(env);
@@ -125,6 +47,48 @@ pub fn register_asset(env: &Env, asset: Address) {
     }
     .publish(env);
     emit_admin_action(env, symbol_short!("reg_asset"), admin, Bytes::new(env));
+}
+
+pub fn get_registered_assets_paginated(
+    env: &Env,
+    cursor: Option<Address>,
+    limit: u32,
+) -> (Vec<Address>, Option<Address>) {
+    if limit == 0 || limit > crate::history::MAX_PAGE_SIZE {
+        panic_with_error!(env, ErrorCode::InvalidPageSize);
+    }
+
+    let registered = read_registered_assets(env);
+    let start = match cursor {
+        Some(last_asset) => {
+            let mut next_index = None;
+            for i in 0..registered.len() {
+                if registered.get_unchecked(i) == last_asset {
+                    next_index = Some(i + 1);
+                    break;
+                }
+            }
+            match next_index {
+                Some(index) => index,
+                None => panic_with_error!(env, ErrorCode::InvalidPageCursor),
+            }
+        }
+        None => 0,
+    };
+
+    let mut page: Vec<Address> = Vec::new(env);
+    let mut index = start;
+    while index < registered.len() && page.len() < limit {
+        page.push_back(registered.get_unchecked(index));
+        index += 1;
+    }
+
+    let next_cursor = if index < registered.len() {
+        Some(page.get_unchecked(page.len() - 1))
+    } else {
+        None
+    };
+    (page, next_cursor)
 }
 
 pub fn unregister_asset(env: &Env, asset: Address) {
