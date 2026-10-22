@@ -5,6 +5,9 @@ use soroban_sdk::{symbol_short, Address, Env, Vec};
 /// Default global inactivity timeout: 0 = disabled.
 const DEFAULT_INACTIVITY_TIMEOUT: u32 = 0;
 
+/// Default per-source clock-skew threshold in seconds: 0 = disabled.
+const DEFAULT_SKEW_THRESHOLD: u64 = 0;
+
 // --- Configuration ---
 
 /// Sets the global default inactivity timeout in ledgers (admin only).
@@ -256,4 +259,17 @@ fn emit_asset_inactivity_warning(env: &Env, asset: &Address, idle_ledgers: u32, 
 fn emit_asset_auto_deregistered(env: &Env, asset: &Address, idle_ledgers: u32) {
     env.events()
         .publish((symbol_short!("auto_dreg"), asset.clone()), (idle_ledgers,));
+}
+
+fn emit_source_skew_alert(
+    env: &Env,
+    source: &Address,
+    ledger_skew: u64,
+    submission_skew: u64,
+    threshold: u64,
+) {
+    env.events().publish(
+        (symbol_short!("skew_alrt"), source.clone()),
+        (ledger_skew, submission_skew, threshold),
+    );
 }
