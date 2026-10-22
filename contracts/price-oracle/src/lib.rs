@@ -3,6 +3,12 @@
 //! Provides price feeds, source reward accounting, and an appeal/correction
 //! process for disputed reward measurements. Corrections are appended as new
 //! records so the original audit trail is never overwritten.
+//!
+//! Fee schedule disclosure and consumer impact review (issue #675):
+//! the fee assumptions and the reproducible consumer-impact method are
+//! published in `docs/fee-schedule.md` and `docs/fee-schedule-review.md`.
+//! The pure calculation below mirrors that method so the review is a
+//! repeatable check rather than a one-off spreadsheet.
 
 #![no_std]
 
@@ -43,6 +49,40 @@ pub struct Correction {
     pub corrected_amount: i128,
     pub approved_by: Address,
     pub recorded_at: u64,
+}
+
+/// Published fee assumptions for a schedule review (issue #675).
+///
+/// All amounts are in stroops (1 XLM = 10_000_000 stroops). The schedule is
+/// disclosed in `docs/fee-schedule.md`; this struct is the machine-readable
+/// form used by the reproducible consumer-impact calculation.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeSchedule {
+    /// Flat fee charged per submitted update, in stroops.
+    pub base_fee: i128,
+    /// Additional fee per asset covered by an update, in stroops.
+    pub per_asset_fee: i128,
+    /// Additional fee per update beyond the first in a batch, in stroops.
+    pub per_update_fee: i128,
+    /// Storage/rent fee per asset per epoch, in stroops.
+    pub storage_fee_per_asset: i128,
+    /// Volume tier threshold in updates; at or above it the tier discount
+    /// applies. Zero disables tiering.
+    pub tier_threshold: u64,
+    /// Discount applied to the variable fees at/above the tier threshold,
+    /// expressed in basis points (e.g. 1000 = 10%).
+    pub tier_discount_bps: u32,
+}
+
+/// Result of the consumer-impact calculation for one integration profile.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeImpact {
+    /// Total fee for the profile, in stroops.
+    pub total_fee: i128,
+    /// Fee as a fraction of gross value, in basis points.
+    pub effective_bps: u32,
 }
 
 #[contracttype]
@@ -174,6 +214,67 @@ impl PriceOracle {
             .get(&DataKey::Corrections(appeal_id))
             .unwrap_or(Vec::new(&env))
     }
+
+    /// Reproducible consumer-impact calculation for a fee schedule review.
+    ///
+    /// Given a schedule, the number of assets and updates an integration
+    /// submits per epoch, and its gross value in stroops, returns the total
+    /// fee and the effective fee in basis points. This is the exact method
+    /// documented in `docs/fee-schedule.md`; the review artifact records the
+    /// inputs and the resulting numbers so they can be re-derived.
+    ///
+    /// Boundary behavior:
+    /// - zero updates or zero assets yields a zero fee (no activity, no charge);
+    /// - tiering only applies when `tier_threshold > 0` and updates reach it;
+    /// - a zero gross value reports `effective_bps == 0` to avoid division by zero.
+    pub fn compute_fee_impact(
+        schedule: FeeSchedule,
+        assets: u64,
+        updates: u64,
+        gross_value: i128,
+    ) -> FeeImpact {
+        if assets == 0 || updates == 0 {
+            return FeeImpact {
+                total_fee: 0,
+                effective_bps: 0,
+            };
+        }
+
+        let assets_i = assets as i128;
+        let updates_i = updates as i128;
+
+        // Variable fees: per-asset and per-update (beyond the first update).
+        let per_asset_total = schedule.per_asset_fee * assets_i;
+        let extra_updates = if updates > 1 { updates_i - 1 } else { 0 };
+        let per_update_total = schedule.per_update_fee * extra_updates;
+        let storage_total = schedule.storage_fee_per_asset * assets_i;
+
+        let mut variable = per_asset_total + per_update_total + storage_total;
+
+        // Volume tier discount on variable fees only; base fee is never discounted.
+        if schedule.tier_threshold > 0 && updates >= schedule.tier_threshold {
+            let bps = schedule.tier_discount_bps as i128;
+            variable -= variable * bps / 10_000;
+        }
+
+        let total_fee = schedule.base_fee + variable;
+
+        let effective_bps = if gross_value > 0 {
+            let bps = total_fee * 10_000 / gross_value;
+            if bps > u32::MAX as i128 {
+                u32::MAX
+            } else {
+                bps as u32
+            }
+        } else {
+            0
+        };
+
+        FeeImpact {
+            total_fee,
+            effective_bps,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -220,5 +321,67 @@ mod test {
         assert_eq!(c.original_amount, 100);
         assert_eq!(c.corrected_amount, 150);
         assert_eq!(c.approved_by, admin);
+    }
+
+    fn sample_schedule() -> FeeSchedule {
+        // Matches the published assumptions in docs/fee-schedule.md.
+        FeeSchedule {
+            base_fee: 100_000,
+            per_asset_fee: 10_000,
+            per_update_fee: 5_000,
+            storage_fee_per_asset: 2_000,
+            tier_threshold: 100,
+            tier_discount_bps: 1_000,
+        }
+    }
+
+    #[test]
+    fn fee_impact_matches_documented_worked_example() {
+        // Worked example from docs/fee-schedule-review.md:
+        // 3 assets, 10 updates, gross 50_000_000 stroops (5 XLM).
+        // variable = 10_000*3 + 5_000*9 + 2_000*3 = 30_000 + 45_000 + 6_000 = 81_000
+        // below tier threshold (10 < 100), no discount.
+        // total = 100_000 + 81_000 = 181_000 stroops.
+        // effective_bps = 181_000 * 10_000 / 50_000_000 = 36 bps.
+        let impact = PriceOracle::compute_fee_impact(sample_schedule(), 3, 10, 50_000_000);
+        assert_eq!(impact.total_fee, 181_000);
+        assert_eq!(impact.effective_bps, 36);
+    }
+
+    #[test]
+    fn fee_impact_applies_tier_discount_at_threshold() {
+        // 1 asset, 100 updates (at threshold), gross 1_000_000_000 stroops.
+        // variable = 10_000 + 5_000*99 + 2_000 = 507_000
+        // discount 10% -> 456_300; total = 100_000 + 456_300 = 556_300.
+        let impact = PriceOracle::compute_fee_impact(sample_schedule(), 1, 100, 1_000_000_000);
+        assert_eq!(impact.total_fee, 556_300);
+    }
+
+    #[test]
+    fn fee_impact_is_zero_without_activity() {
+        let zero_updates = PriceOracle::compute_fee_impact(sample_schedule(), 5, 0, 1_000_000);
+        assert_eq!(zero_updates.total_fee, 0);
+        assert_eq!(zero_updates.effective_bps, 0);
+
+        let zero_assets = PriceOracle::compute_fee_impact(sample_schedule(), 0, 5, 1_000_000);
+        assert_eq!(zero_assets.total_fee, 0);
+        assert_eq!(zero_assets.effective_bps, 0);
+    }
+
+    #[test]
+    fn fee_impact_handles_zero_gross_value() {
+        let impact = PriceOracle::compute_fee_impact(sample_schedule(), 1, 1, 0);
+        assert_eq!(impact.total_fee, 100_000);
+        assert_eq!(impact.effective_bps, 0);
+    }
+
+    #[test]
+    fn small_integration_cost_is_bounded() {
+        // Smallest active integration: 1 asset, 1 update, gross 10_000_000 (1 XLM).
+        // total = base 100_000 + per_asset 10_000 + storage 2_000 = 112_000.
+        // effective_bps = 112_000 * 10_000 / 10_000_000 = 112 bps.
+        let impact = PriceOracle::compute_fee_impact(sample_schedule(), 1, 1, 10_000_000);
+        assert_eq!(impact.total_fee, 112_000);
+        assert_eq!(impact.effective_bps, 112);
     }
 }
