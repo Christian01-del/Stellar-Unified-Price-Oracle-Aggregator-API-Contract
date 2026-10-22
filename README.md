@@ -289,3 +289,8 @@ MIT
 ## Service Level Agreement
 
 See [docs/SLA.md](docs/SLA.md) for price freshness guarantees, uptime commitments, deviation thresholds, incident response times, and compensation terms.
+
+## Handsoff notes
+
+<!-- handsoff-issue-607 -->
+- #607: [Mainnet] Mainnet upgrade rehearsal and approval record
