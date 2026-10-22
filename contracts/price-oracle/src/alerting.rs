@@ -2,8 +2,12 @@
 //!
 //! Monitors for price deviations vs external references and triggers alerts
 //! when thresholds are exceeded. Supports multiple notification channels.
+//!
+//! Also hosts the per-asset operating cost model (#669): recurring RPC,
+//! storage, monitoring, and incident costs are derived from measured inputs
+//! and reconciled against sampled production-like measurements.
 
-use soroban_sdk::{Address, Env};
+use soroban_sdk::{Address, Env, Vec};
 
 use crate::events::PriceDeviationAlertEvent;
 use crate::storage::LEDGER_BUMP;
@@ -108,4 +112,123 @@ pub fn register_reference_oracle(env: &Env, asset: Address, reference_oracle: Ad
 pub fn get_last_alert_price(env: &Env, asset: &Address) -> i128 {
     let key = DataKey::AlertLastPrice(asset.clone());
     env.storage().persistent().get(&key).unwrap_or(0i128)
+}
+
+// ---------------------------------------------------------------------------
+// Per-asset operating cost model (#669)
+// ---------------------------------------------------------------------------
+
+/// Measured recurring inputs for a single supported asset, expressed in
+/// stroops (1 XLM = 10_000_000 stroops) so the model stays integer-exact.
+///
+/// All fields are *measured* values sampled from production-like runs; the
+/// model never invents them. `sample_count` records how many samples back the
+/// inputs so reconciliation can reject under-sampled assumptions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AssetCostInputs {
+    /// RPC calls per month for this asset (price reads, submissions).
+    pub rpc_calls_per_month: u32,
+    /// Measured stroop cost per RPC call.
+    pub rpc_cost_per_call: i128,
+    /// Persistent storage entries kept live for this asset.
+    pub storage_entries: u32,
+    /// Measured stroop cost to (re)extend one storage entry per month.
+    pub storage_cost_per_entry: i128,
+    /// Monitoring checks per month (deviation checks, heartbeats).
+    pub monitoring_checks_per_month: u32,
+    /// Measured stroop cost per monitoring check.
+    pub monitoring_cost_per_check: i128,
+    /// Expected incidents per month for this asset.
+    pub incidents_per_month: u32,
+    /// Measured stroop cost to resolve one incident.
+    pub incident_cost: i128,
+    /// Number of production-like samples backing these inputs.
+    pub sample_count: u32,
+}
+
+/// Breakdown of the recurring monthly cost for one asset, in stroops.
+pub struct AssetCostBreakdown {
+    pub rpc_cost: i128,
+    pub storage_cost: i128,
+    pub monitoring_cost: i128,
+    pub incident_cost: i128,
+    pub total_cost: i128,
+}
+
+/// Minimum number of production-like samples required before a cost model is
+/// considered reconciled. Below this the model is treated as an assumption.
+pub const MIN_COST_SAMPLES: u32 = 3;
+
+/// Computes the recurring monthly operating cost for one asset from measured
+/// inputs. Returns `None` when inputs are invalid (negative costs) so callers
+/// can surface a failure path instead of silently under-reporting.
+pub fn compute_asset_cost(inputs: &AssetCostInputs) -> Option<AssetCostBreakdown> {
+    if inputs.rpc_cost_per_call < 0
+        || inputs.storage_cost_per_entry < 0
+        || inputs.monitoring_cost_per_check < 0
+        || inputs.incident_cost < 0
+    {
+        return None;
+    }
+
+    let rpc_cost = (inputs.rpc_calls_per_month as i128) * inputs.rpc_cost_per_call;
+    let storage_cost = (inputs.storage_entries as i128) * inputs.storage_cost_per_entry;
+    let monitoring_cost =
+        (inputs.monitoring_checks_per_month as i128) * inputs.monitoring_cost_per_check;
+    let incident_cost = (inputs.incidents_per_month as i128) * inputs.incident_cost;
+    let total_cost = rpc_cost + storage_cost + monitoring_cost + incident_cost;
+
+    Some(AssetCostBreakdown {
+        rpc_cost,
+        storage_cost,
+        monitoring_cost,
+        incident_cost,
+        total_cost,
+    })
+}
+
+/// Reconciles the model's assumed inputs against sampled production-like
+/// measurements. Returns `true` when the model is backed by at least
+/// `MIN_COST_SAMPLES` samples and the sampled total is within
+/// `tolerance_bps` of the modelled total.
+///
+/// This is the repeatable check that keeps assumptions honest: a model that
+/// drifts from measurements fails reconciliation rather than being trusted.
+pub fn reconcile_asset_cost(
+    inputs: &AssetCostInputs,
+    sampled_total_cost: i128,
+    tolerance_bps: u32,
+) -> bool {
+    if inputs.sample_count < MIN_COST_SAMPLES || sampled_total_cost < 0 {
+        return false;
+    }
+
+    let modelled = match compute_asset_cost(inputs) {
+        Some(b) => b.total_cost,
+        None => return false,
+    };
+
+    if modelled == 0 {
+        return sampled_total_cost == 0;
+    }
+
+    let diff = (modelled - sampled_total_cost).abs();
+    let drift_bps = (diff * 10_000) / modelled;
+    drift_bps <= tolerance_bps as i128
+}
+
+/// Aggregates the recurring monthly cost across all supported assets.
+///
+/// Invalid inputs are skipped so a single bad asset cannot mask the fleet
+/// total; callers should reconcile each asset individually first.
+pub fn total_fleet_cost(assets: &Vec<AssetCostInputs>) -> i128 {
+    let mut total = 0i128;
+    for i in 0..assets.len() {
+        if let Some(inputs) = assets.get(i) {
+            if let Some(breakdown) = compute_asset_cost(&inputs) {
+                total += breakdown.total_cost;
+            }
+        }
+    }
+    total
 }

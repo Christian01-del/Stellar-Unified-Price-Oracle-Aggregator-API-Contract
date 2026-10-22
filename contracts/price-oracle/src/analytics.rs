@@ -18,6 +18,12 @@
 //! The report states its assumptions, the runway per scenario, and the threshold
 //! that triggers a funding review. The model is pure and integer-only so it can
 //! be replayed and asserted by automated checks.
+//!
+//! Oracle operating cost per asset model (#669): recurring RPC, storage,
+//! monitoring, and incident costs are computed per supported asset from measured
+//! inputs. The model reconciles input assumptions against sampled production-like
+//! measurements and is pure and integer-only so it can be replayed and asserted
+//! by automated checks.
 
 use soroban_sdk::{Address, Env, Vec};
 
@@ -216,157 +222,221 @@ pub struct RewardPilotReport {
     /// Cost per accurate submission (0 when there are no accurate submissions).
     pub cost_per_accurate: i128,
     /// Whether the participation target was met.
-    pub participation_ok: bool,
+    pub participation_met: bool,
     /// Whether the quality target was met.
-    pub quality_ok: bool,
-    /// Whether the total cost stayed within budget.
-    pub cost_ok: bool,
-    /// Whether cost per accurate submission stayed within budget.
-    pub cost_per_accurate_ok: bool,
-    /// Deterministic pause decision: `true` means the pilot must pause.
-    pub should_pause: bool,
+    pub quality_met: bool,
+    /// Whether the total spend stayed within the pilot budget.
+    pub cost_met: bool,
+    /// Whether the cost-per-accurate target was met.
+    pub cost_per_accurate_met: bool,
 }
 
-// ---------------------------------------------------------------------------
-// Treasury runway and funding scenarios (#668)
-// ---------------------------------------------------------------------------
-
-/// Operational scenario used to model treasury runway.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TreasuryScenario {
-    /// Expected steady-state operation.
-    Baseline,
-    /// Reduced usage: lower submission volume and lower reward spend.
-    LowUsage,
-    /// Elevated incident response: higher operational and reward spend.
-    HighIncident,
+impl RewardPilotReport {
+    /// Returns true when every target was met and the pilot may continue.
+    pub fn all_targets_met(&self) -> bool {
+        self.participation_met && self.quality_met && self.cost_met && self.cost_per_accurate_met
+    }
 }
 
-/// Assumptions and inputs for the treasury runway model.
+/// Evaluates pilot metrics against targets, producing a deterministic report.
 ///
-/// All monetary values are expressed in the same integer reward units used by
-/// the reward pilot. Ratios are in basis points (1 bps = 0.01%).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TreasuryAssumptions {
-    /// Committed funding available to the treasury (reward units).
-    pub committed_funding: i128,
-    /// Baseline operational spend per period (reward units).
-    pub baseline_operational_spend: i128,
-    /// Baseline reward spend per period (reward units).
-    pub baseline_reward_spend: i128,
-    /// Low-usage spend multiplier (bps of baseline).
-    pub low_usage_spend_bps: u32,
-    /// High-incident spend multiplier (bps of baseline).
-    pub high_incident_spend_bps: u32,
-    /// Minimum runway (in periods) that triggers a funding review.
-    pub funding_review_threshold_periods: u32,
+/// Ratios are computed in basis points with integer division (floor). When the
+/// denominator is zero the corresponding ratio is reported as zero and the
+/// target is treated as unmet, so an empty pilot never silently passes.
+pub fn evaluate_reward_pilot(
+    targets: &RewardPilotTargets,
+    metrics: &RewardPilotMetrics,
+) -> RewardPilotReport {
+    let participation_bps = if metrics.eligible_sources > 0 {
+        ((metrics.participating_sources as u64 * 10_000) / metrics.eligible_sources as u64) as u32
+    } else {
+        0
+    };
+
+    let quality_bps = if metrics.total_submissions > 0 {
+        ((metrics.accurate_submissions as u64 * 10_000) / metrics.total_submissions as u64) as u32
+    } else {
+        0
+    };
+
+    let cost_per_accurate = if metrics.accurate_submissions > 0 {
+        metrics.total_cost / metrics.accurate_submissions as i128
+    } else {
+        0
+    };
+
+    RewardPilotReport {
+        participation_bps,
+        quality_bps,
+        cost_per_accurate,
+        participation_met: metrics.eligible_sources > 0
+            && participation_bps >= targets.min_participation_bps,
+        quality_met: metrics.total_submissions > 0 && quality_bps >= targets.min_quality_bps,
+        cost_met: metrics.total_cost <= targets.max_cost,
+        cost_per_accurate_met: metrics.accurate_submissions > 0
+            && cost_per_accurate <= targets.max_cost_per_accurate,
+    }
 }
 
-impl TreasuryAssumptions {
-    /// Default assumptions: 12-month committed funding, 50% low-usage and
-    /// 200% high-incident spend, with a 6-period funding-review threshold.
-    pub fn default_assumptions() -> Self {
+// ---------------------------------------------------------------------------
+// Oracle operating cost per asset model (#669)
+// ---------------------------------------------------------------------------
+
+/// Measured recurring inputs for a single supported asset.
+///
+/// All monetary values are expressed in the smallest cost unit (e.g. stroops)
+/// and all counts are per accounting period (typically one month). Inputs are
+/// intended to be sampled from production-like measurements so the model can be
+/// reconciled against observed operation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AssetCostInputs {
+    /// RPC calls per period for this asset (reads, writes, simulations).
+    pub rpc_calls: u32,
+    /// Cost per RPC call (in cost units).
+    pub rpc_cost_per_call: i128,
+    /// Persistent storage entries maintained for this asset.
+    pub storage_entries: u32,
+    /// Cost per storage entry per period (in cost units).
+    pub storage_cost_per_entry: i128,
+    /// Monitoring checks per period for this asset.
+    pub monitoring_checks: u32,
+    /// Cost per monitoring check (in cost units).
+    pub monitoring_cost_per_check: i128,
+    /// Expected incidents per period for this asset.
+    pub incidents_per_period: u32,
+    /// Cost per incident (in cost units).
+    pub incident_cost: i128,
+}
+
+impl AssetCostInputs {
+    /// Default measured inputs used as the baseline assumption set.
+    pub fn default_measured() -> Self {
         Self {
-            committed_funding: 1_200_000,
-            baseline_operational_spend: 50_000,
-            baseline_reward_spend: 50_000,
-            low_usage_spend_bps: 5_000,
-            high_incident_spend_bps: 20_000,
-            funding_review_threshold_periods: 6,
+            rpc_calls: 100_000,
+            rpc_cost_per_call: 10,
+            storage_entries: 50,
+            storage_cost_per_entry: 1_000,
+            monitoring_checks: 8_640,
+            monitoring_cost_per_check: 5,
+            incidents_per_period: 1,
+            incident_cost: 50_000,
         }
     }
 }
 
-/// Runway result for a single scenario.
+/// Breakdown of recurring operating cost for a single asset.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TreasuryScenarioReport {
-    /// Scenario modeled.
-    pub scenario: TreasuryScenario,
-    /// Total spend per period under this scenario (reward units).
-    pub spend_per_period: i128,
-    /// Number of whole periods the committed funding covers (0 when spend is 0).
-    pub runway_periods: u32,
-    /// Whether runway is at or below the funding-review threshold.
-    pub funding_review_required: bool,
+pub struct AssetCostBreakdown {
+    /// Recurring RPC cost for the period.
+    pub rpc_cost: i128,
+    /// Recurring storage cost for the period.
+    pub storage_cost: i128,
+    /// Recurring monitoring cost for the period.
+    pub monitoring_cost: i128,
+    /// Expected incident cost for the period.
+    pub incident_cost: i128,
+    /// Total recurring cost for the period.
+    pub total_cost: i128,
 }
 
-/// Deterministic treasury runway report across all scenarios.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TreasuryRunwayReport {
-    /// Assumptions used to produce the report.
-    pub assumptions: TreasuryAssumptions,
-    /// Baseline scenario result.
-    pub baseline: TreasuryScenarioReport,
-    /// Low-usage scenario result.
-    pub low_usage: TreasuryScenarioReport,
-    /// High-incident scenario result.
-    pub high_incident: TreasuryScenarioReport,
-    /// Whether any scenario requires a funding review.
-    pub funding_review_required: bool,
-}
-
-/// Computes the spend per period for a scenario from the assumptions.
-fn scenario_spend_per_period(assumptions: &TreasuryAssumptions, scenario: TreasuryScenario) -> i128 {
-    let baseline = assumptions
-        .baseline_operational_spend
-        .saturating_add(assumptions.baseline_reward_spend);
-    let multiplier_bps = match scenario {
-        TreasuryScenario::Baseline => 10_000u32,
-        TreasuryScenario::LowUsage => assumptions.low_usage_spend_bps,
-        TreasuryScenario::HighIncident => assumptions.high_incident_spend_bps,
-    };
-    baseline.saturating_mul(multiplier_bps as i128) / 10_000
-}
-
-/// Computes the runway (whole periods) for a given spend per period.
-fn runway_periods(committed_funding: i128, spend_per_period: i128) -> u32 {
-    if spend_per_period <= 0 {
-        return 0;
-    }
-    let periods = committed_funding / spend_per_period;
-    if periods <= 0 {
-        0
-    } else if periods > u32::MAX as i128 {
-        u32::MAX
-    } else {
-        periods as u32
-    }
-}
-
-fn evaluate_scenario(
-    assumptions: &TreasuryAssumptions,
-    scenario: TreasuryScenario,
-) -> TreasuryScenarioReport {
-    let spend_per_period = scenario_spend_per_period(assumptions, scenario);
-    let runway = runway_periods(assumptions.committed_funding, spend_per_period);
-    let funding_review_required = runway <= assumptions.funding_review_threshold_periods;
-    TreasuryScenarioReport {
-        scenario,
-        spend_per_period,
-        runway_periods: runway,
-        funding_review_required,
-    }
-}
-
-/// Models treasury runway and committed funding under baseline, low-usage, and
-/// high-incident scenarios.
+/// Computes the recurring operating cost breakdown for a single asset.
 ///
-/// The model is pure and integer-only: given the same [`TreasuryAssumptions`]
-/// it always produces the same [`TreasuryRunwayReport`], so it can be replayed
-/// and asserted by automated checks. A scenario triggers a funding review when
-/// its runway is at or below `funding_review_threshold_periods`.
-pub fn model_treasury_runway(assumptions: TreasuryAssumptions) -> TreasuryRunwayReport {
-    let baseline = evaluate_scenario(&assumptions, TreasuryScenario::Baseline);
-    let low_usage = evaluate_scenario(&assumptions, TreasuryScenario::LowUsage);
-    let high_incident = evaluate_scenario(&assumptions, TreasuryScenario::HighIncident);
-    let funding_review_required = baseline.funding_review_required
-        || low_usage.funding_review_required
-        || high_incident.funding_review_required;
-    TreasuryRunwayReport {
-        assumptions,
-        baseline,
-        low_usage,
-        high_incident,
-        funding_review_required,
+/// The computation is integer-only and saturating so extreme inputs cannot
+/// overflow and produce a misleading total.
+pub fn compute_asset_cost(inputs: &AssetCostInputs) -> AssetCostBreakdown {
+    let rpc_cost = (inputs.rpc_calls as i128).saturating_mul(inputs.rpc_cost_per_call);
+    let storage_cost =
+        (inputs.storage_entries as i128).saturating_mul(inputs.storage_cost_per_entry);
+    let monitoring_cost =
+        (inputs.monitoring_checks as i128).saturating_mul(inputs.monitoring_cost_per_check);
+    let incident_cost =
+        (inputs.incidents_per_period as i128).saturating_mul(inputs.incident_cost);
+
+    let total_cost = rpc_cost
+        .saturating_add(storage_cost)
+        .saturating_add(monitoring_cost)
+        .saturating_add(incident_cost);
+
+    AssetCostBreakdown {
+        rpc_cost,
+        storage_cost,
+        monitoring_cost,
+        incident_cost,
+        total_cost,
+    }
+}
+
+/// Reconciliation result comparing assumed inputs against sampled measurements.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AssetCostReconciliation {
+    /// Cost computed from the assumed inputs.
+    pub assumed_total: i128,
+    /// Cost computed from the sampled measurements.
+    pub sampled_total: i128,
+    /// Absolute difference between assumed and sampled totals.
+    pub delta: i128,
+    /// Whether the delta is within the allowed tolerance.
+    pub within_tolerance: bool,
+}
+
+/// Reconciles assumed inputs against sampled production-like measurements.
+///
+/// The model is considered reconciled when the absolute difference between the
+/// assumed and sampled totals is at most `tolerance` (in cost units). A zero
+/// tolerance requires an exact match.
+pub fn reconcile_asset_cost(
+    assumed: &AssetCostInputs,
+    sampled: &AssetCostInputs,
+    tolerance: i128,
+) -> AssetCostReconciliation {
+    let assumed_total = compute_asset_cost(assumed).total_cost;
+    let sampled_total = compute_asset_cost(sampled).total_cost;
+    let delta = if assumed_total >= sampled_total {
+        assumed_total - sampled_total
+    } else {
+        sampled_total - assumed_total
+    };
+
+    AssetCostReconciliation {
+        assumed_total,
+        sampled_total,
+        delta,
+        within_tolerance: delta <= tolerance,
+    }
+}
+
+/// Aggregated operating cost across all supported assets.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PortfolioCostReport {
+    /// Number of assets included in the report.
+    pub asset_count: u32,
+    /// Total recurring cost across all assets for the period.
+    pub total_cost: i128,
+    /// Average recurring cost per asset (0 when there are no assets).
+    pub average_cost_per_asset: i128,
+}
+
+/// Aggregates per-asset cost breakdowns into a portfolio-level report.
+///
+/// Each entry in `per_asset` is the breakdown for one supported asset. The
+/// average is computed with integer division (floor) and is zero when no assets
+/// are supplied, so an empty portfolio never divides by zero.
+pub fn aggregate_portfolio_cost(per_asset: &Vec<AssetCostBreakdown>) -> PortfolioCostReport {
+    let asset_count = per_asset.len();
+    let mut total_cost: i128 = 0;
+    for breakdown in per_asset.iter() {
+        total_cost = total_cost.saturating_add(breakdown.total_cost);
+    }
+
+    let average_cost_per_asset = if asset_count > 0 {
+        total_cost / asset_count as i128
+    } else {
+        0
+    };
+
+    PortfolioCostReport {
+        asset_count,
+        total_cost,
+        average_cost_per_asset,
     }
 }
