@@ -53,6 +53,79 @@ All 56 tests should pass with zero warnings.
 - Include the error code, the function called, and a minimal reproduction.
 - For feature requests, describe the use case and how it fits the oracle aggregator model.
 
+## Integration Support Intake and Triage
+
+Consumers integrating with the oracle (wallets, dApps, indexers, downstream services) file
+integration reports through the **public path** below. This is the single supported channel for
+production consumer support; do not send integration reports through private channels.
+
+### Public Path for Filing Reports
+
+- **Where:** open a GitHub issue using the `integration-report` label on this repository.
+  This is the public, traceable intake path.
+- **Who may file:** any consumer, including external integrators without write access.
+- **Do not** include secrets, private keys, signing material, API tokens, or production
+  credentials in a report. Redact them before filing; if a secret may have leaked, report only
+  that a leak occurred and rotate it out-of-band — never paste the value.
+
+### Required Reproduction Data
+
+Every integration report must include the following fields so it can be reproduced and triaged:
+
+| Field | Description |
+|---|---|
+| `network` | Target network (`testnet`, `futurenet`, or `mainnet`) |
+| `contract_id` | Deployed oracle contract ID (public; never a secret) |
+| `sdk_version` | Client SDK / library name and version used to call the contract |
+| `function` | Contract entry point invoked (e.g. `get_price`, `get_prices`) |
+| `inputs` | Sanitized arguments passed to the call (asset pairs, amounts) |
+| `expected` | Expected result or behavior |
+| `actual` | Observed result, including error code if any |
+| `reproduction` | Minimal steps or snippet to reproduce (secrets redacted) |
+| `first_seen` | Timestamp (UTC) when the issue was first observed |
+
+Reports missing required fields are labeled `needs-info` and returned to the reporter for
+completion before triage proceeds.
+
+### Response Ownership
+
+- **Triagers** own first response: acknowledge within 2 business days, apply the triage label,
+  and request missing reproduction data.
+- **Maintainers** own resolution of `sev-1`/`sev-2` reports and coordinate fixes.
+- **Core Maintainers** own any report touching upgrade/admin paths or suspected secret exposure.
+
+### Severity Routing
+
+Each report is routed to exactly one triage category via label:
+
+| Label | Category | Routing |
+|---|---|---|
+| `sev-1` | Contract correctness / funds at risk / suspected secret exposure | Core Maintainers, immediate |
+| `sev-2` | Incorrect prices or broken core calls on `mainnet` | Maintainers, same day |
+| `sev-3` | Degraded behavior or workaround available | Triagers, within 2 business days |
+| `sev-4` | Documentation, ergonomics, or feature requests | Triagers, backlog |
+
+### Sample Report
+
+A minimal, secret-free report that traces to a documented category:
+
+```
+Title: get_price returns stale timestamp on testnet
+network: testnet
+contract_id: C...PUBLIC_CONTRACT_ID...
+sdk_version: @stellar/stellar-sdk 12.0.0
+function: get_price
+inputs: { asset: "XLM/USD" }
+expected: timestamp within 60s of ledger close
+actual: timestamp ~10m old; no error code
+reproduction: call get_price("XLM/USD") on testnet, compare timestamp to latest ledger
+first_seen: 2025-01-01T00:00:00Z
+```
+
+This sample routes to **`sev-3`** (degraded behavior, workaround available) and is owned by a
+**Triager** for first response. It contains no secrets — only a public contract ID and public
+inputs.
+
 ## Governance Proposals
 
 For proposals related to contract upgrades, parameter changes, source additions/removals, or asset management, use the standardized template:
@@ -60,6 +133,13 @@ For proposals related to contract upgrades, parameter changes, source additions/
 👉 [Governance Proposal Template](docs/governance-proposal-template.md)
 
 Submit completed proposals as a GitHub issue or pull request for community review before any on-chain action is taken.
+
+## Mainnet Release Go/No-Go
+
+Before any mainnet release, complete the [mainnet release checklist](docs/mainnet-release-checklist.md).
+Each production gate must record an owner, an evidence link, and an explicit pass/fail result.
+The release workflow runs `scripts/check-release-evidence.sh`, which blocks the release when any
+mandatory evidence is absent. Never commit secrets or production credentials as evidence.
 
 ## Contributor Ladder
 
@@ -104,6 +184,8 @@ Privileged access (Triager and above) expires automatically after **90 days of i
 2. The contributor is notified and may request reinstatement by demonstrating current activity.
 
 A dry run of the expiry process is performed quarterly by a Core Maintainer, with results documented as an issue.
+The same quarterly review covers deployment, monitoring, source and treasury access for humans and
+automation; see [docs/security/access-review.md](docs/security/access-review.md).
 
 ### Removal and Demotion
 
