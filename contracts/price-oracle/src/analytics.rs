@@ -12,6 +12,12 @@
 //! metrics map to a reproducible source reward calculation. Allocations are
 //! derived from retained events so an independent replay reproduces every
 //! allocation within the documented rounding rules.
+//!
+//! Treasury runway and funding scenarios (#668): operational spend and committed
+//! funding are modeled under baseline, low-usage, and high-incident scenarios.
+//! The report states its assumptions, the runway per scenario, and the threshold
+//! that triggers a funding review. The model is pure and integer-only so it can
+//! be replayed and asserted by automated checks.
 
 use soroban_sdk::{Address, Env, Vec};
 
@@ -221,194 +227,146 @@ pub struct RewardPilotReport {
     pub should_pause: bool,
 }
 
-/// Computes a ratio in basis points, saturating at `u32::MAX` and returning 0
-/// when the denominator is zero. Integer-only for deterministic replay.
-fn ratio_bps(numerator: u32, denominator: u32) -> u32 {
-    if denominator == 0 {
+// ---------------------------------------------------------------------------
+// Treasury runway and funding scenarios (#668)
+// ---------------------------------------------------------------------------
+
+/// Operational scenario used to model treasury runway.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TreasuryScenario {
+    /// Expected steady-state operation.
+    Baseline,
+    /// Reduced usage: lower submission volume and lower reward spend.
+    LowUsage,
+    /// Elevated incident response: higher operational and reward spend.
+    HighIncident,
+}
+
+/// Assumptions and inputs for the treasury runway model.
+///
+/// All monetary values are expressed in the same integer reward units used by
+/// the reward pilot. Ratios are in basis points (1 bps = 0.01%).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreasuryAssumptions {
+    /// Committed funding available to the treasury (reward units).
+    pub committed_funding: i128,
+    /// Baseline operational spend per period (reward units).
+    pub baseline_operational_spend: i128,
+    /// Baseline reward spend per period (reward units).
+    pub baseline_reward_spend: i128,
+    /// Low-usage spend multiplier (bps of baseline).
+    pub low_usage_spend_bps: u32,
+    /// High-incident spend multiplier (bps of baseline).
+    pub high_incident_spend_bps: u32,
+    /// Minimum runway (in periods) that triggers a funding review.
+    pub funding_review_threshold_periods: u32,
+}
+
+impl TreasuryAssumptions {
+    /// Default assumptions: 12-month committed funding, 50% low-usage and
+    /// 200% high-incident spend, with a 6-period funding-review threshold.
+    pub fn default_assumptions() -> Self {
+        Self {
+            committed_funding: 1_200_000,
+            baseline_operational_spend: 50_000,
+            baseline_reward_spend: 50_000,
+            low_usage_spend_bps: 5_000,
+            high_incident_spend_bps: 20_000,
+            funding_review_threshold_periods: 6,
+        }
+    }
+}
+
+/// Runway result for a single scenario.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreasuryScenarioReport {
+    /// Scenario modeled.
+    pub scenario: TreasuryScenario,
+    /// Total spend per period under this scenario (reward units).
+    pub spend_per_period: i128,
+    /// Number of whole periods the committed funding covers (0 when spend is 0).
+    pub runway_periods: u32,
+    /// Whether runway is at or below the funding-review threshold.
+    pub funding_review_required: bool,
+}
+
+/// Deterministic treasury runway report across all scenarios.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreasuryRunwayReport {
+    /// Assumptions used to produce the report.
+    pub assumptions: TreasuryAssumptions,
+    /// Baseline scenario result.
+    pub baseline: TreasuryScenarioReport,
+    /// Low-usage scenario result.
+    pub low_usage: TreasuryScenarioReport,
+    /// High-incident scenario result.
+    pub high_incident: TreasuryScenarioReport,
+    /// Whether any scenario requires a funding review.
+    pub funding_review_required: bool,
+}
+
+/// Computes the spend per period for a scenario from the assumptions.
+fn scenario_spend_per_period(assumptions: &TreasuryAssumptions, scenario: TreasuryScenario) -> i128 {
+    let baseline = assumptions
+        .baseline_operational_spend
+        .saturating_add(assumptions.baseline_reward_spend);
+    let multiplier_bps = match scenario {
+        TreasuryScenario::Baseline => 10_000u32,
+        TreasuryScenario::LowUsage => assumptions.low_usage_spend_bps,
+        TreasuryScenario::HighIncident => assumptions.high_incident_spend_bps,
+    };
+    baseline.saturating_mul(multiplier_bps as i128) / 10_000
+}
+
+/// Computes the runway (whole periods) for a given spend per period.
+fn runway_periods(committed_funding: i128, spend_per_period: i128) -> u32 {
+    if spend_per_period <= 0 {
         return 0;
     }
-    let scaled = (numerator as u64)
-        .saturating_mul(10_000)
-        .checked_div(denominator as u64)
-        .unwrap_or(0);
-    if scaled > u32::MAX as u64 {
+    let periods = committed_funding / spend_per_period;
+    if periods <= 0 {
+        0
+    } else if periods > u32::MAX as i128 {
         u32::MAX
     } else {
-        scaled as u32
+        periods as u32
     }
 }
 
-// ---------------------------------------------------------------------------
-// Reward attribution and event reconciliation (#667)
-// ---------------------------------------------------------------------------
+fn evaluate_scenario(
+    assumptions: &TreasuryAssumptions,
+    scenario: TreasuryScenario,
+) -> TreasuryScenarioReport {
+    let spend_per_period = scenario_spend_per_period(assumptions, scenario);
+    let runway = runway_periods(assumptions.committed_funding, spend_per_period);
+    let funding_review_required = runway <= assumptions.funding_review_threshold_periods;
+    TreasuryScenarioReport {
+        scenario,
+        spend_per_period,
+        runway_periods: runway,
+        funding_review_required,
+    }
+}
 
-/// A single retained reward event used as the source of truth for attribution.
+/// Models treasury runway and committed funding under baseline, low-usage, and
+/// high-incident scenarios.
 ///
-/// Each event captures the submitted data and quality metrics for one source
-/// during one round. Reward allocations are derived *only* from these retained
-/// events, so an independent replay over the same event log reproduces every
-/// allocation exactly.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RewardEvent {
-    /// Source that produced the submission.
-    pub source: Address,
-    /// Round the submission belongs to (used for deterministic ordering).
-    pub round: u32,
-    /// Accuracy score for the submission (0–100).
-    pub accuracy: u32,
-    /// Whether the submission met the accuracy threshold.
-    pub accurate: bool,
-}
-
-/// Deterministic reward allocation for a single source.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RewardAllocation {
-    /// Source receiving the allocation.
-    pub source: Address,
-    /// Total reward units allocated to the source.
-    pub amount: i128,
-}
-
-/// Reward attribution parameters. All weights are integer reward units so the
-/// calculation is exact and reproducible.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RewardAttributionParams {
-    /// Reward units granted per accurate submission.
-    pub reward_per_accurate: i128,
-    /// Reward units granted per submission regardless of accuracy.
-    pub reward_per_submission: i128,
-    /// Accuracy threshold (0–100) a submission must meet to count as accurate.
-    pub accuracy_threshold: u32,
-    /// Total reward budget for the attribution window.
-    pub budget: i128,
-}
-
-impl RewardAttributionParams {
-    /// Default attribution parameters: 10 per accurate, 1 per submission,
-    /// 80 accuracy threshold, 1,000,000 budget.
-    pub fn default_params() -> Self {
-        Self {
-            reward_per_accurate: 10,
-            reward_per_submission: 1,
-            accuracy_threshold: 80,
-            budget: 1_000_000,
-        }
+/// The model is pure and integer-only: given the same [`TreasuryAssumptions`]
+/// it always produces the same [`TreasuryRunwayReport`], so it can be replayed
+/// and asserted by automated checks. A scenario triggers a funding review when
+/// its runway is at or below `funding_review_threshold_periods`.
+pub fn model_treasury_runway(assumptions: TreasuryAssumptions) -> TreasuryRunwayReport {
+    let baseline = evaluate_scenario(&assumptions, TreasuryScenario::Baseline);
+    let low_usage = evaluate_scenario(&assumptions, TreasuryScenario::LowUsage);
+    let high_incident = evaluate_scenario(&assumptions, TreasuryScenario::HighIncident);
+    let funding_review_required = baseline.funding_review_required
+        || low_usage.funding_review_required
+        || high_incident.funding_review_required;
+    TreasuryRunwayReport {
+        assumptions,
+        baseline,
+        low_usage,
+        high_incident,
+        funding_review_required,
     }
-}
-
-/// Computes the raw (pre-budget) reward for a single event.
-///
-/// Formula: `reward_per_submission + (accurate ? reward_per_accurate : 0)`.
-/// Accuracy is derived from the event's `accuracy` field against the
-/// configured threshold, so replay does not depend on the stored `accurate`
-/// flag and reconciles it against the retained metric.
-fn event_reward(params: &RewardAttributionParams, event: &RewardEvent) -> i128 {
-    let is_accurate = event.accuracy >= params.accuracy_threshold;
-    let mut reward = params.reward_per_submission;
-    if is_accurate {
-        reward = reward.saturating_add(params.reward_per_accurate);
-    }
-    reward.max(0)
-}
-
-/// Computes reproducible reward allocations from retained events.
-///
-/// # Determinism and rounding rules
-/// - Events are processed in the order provided; callers must supply events in
-///   canonical `(round, source)` order for cross-environment replay.
-/// - Per-source raw rewards are summed exactly (integer arithmetic, no floats).
-/// - If the summed raw rewards exceed `budget`, each source's allocation is
-///   scaled down proportionally using integer floor division:
-///   `amount = raw * budget / total_raw`. The remainder is left unallocated
-///   (never redistributed), so replay is exact and order-independent.
-/// - If `total_raw <= budget`, allocations equal the raw rewards exactly.
-/// - Sources with zero raw reward receive no allocation entry.
-///
-/// Returns allocations in the same order sources first appear in `events`.
-pub fn compute_reward_allocations(
-    env: &Env,
-    params: &RewardAttributionParams,
-    events: &Vec<RewardEvent>,
-) -> Vec<RewardAllocation> {
-    let mut sources: Vec<Address> = Vec::new(env);
-    let mut raws: Vec<i128> = Vec::new(env);
-
-    for i in 0..events.len() {
-        let event = events.get(i).unwrap();
-        let reward = event_reward(params, &event);
-
-        // Find existing source index (linear scan keeps ordering deterministic).
-        let mut found: Option<u32> = None;
-        for j in 0..sources.len() {
-            if sources.get(j).unwrap() == event.source {
-                found = Some(j);
-                break;
-            }
-        }
-
-        match found {
-            Some(idx) => {
-                let prev = raws.get(idx).unwrap();
-                raws.set(idx, prev.saturating_add(reward));
-            }
-            None => {
-                sources.push_back(event.source.clone());
-                raws.push_back(reward);
-            }
-        }
-    }
-
-    // Sum raw rewards for budget scaling.
-    let mut total_raw: i128 = 0;
-    for i in 0..raws.len() {
-        total_raw = total_raw.saturating_add(raws.get(i).unwrap());
-    }
-
-    let mut allocations: Vec<RewardAllocation> = Vec::new(env);
-    for i in 0..sources.len() {
-        let raw = raws.get(i).unwrap();
-        if raw <= 0 {
-            continue;
-        }
-        let amount = if total_raw > params.budget && total_raw > 0 {
-            // Proportional floor scaling; remainder intentionally unallocated.
-            raw.saturating_mul(params.budget.max(0)) / total_raw
-        } else {
-            raw
-        };
-        if amount > 0 {
-            allocations.push_back(RewardAllocation {
-                source: sources.get(i).unwrap(),
-                amount,
-            });
-        }
-    }
-
-    allocations
-}
-
-/// Reconciles retained events against a previously computed allocation set.
-///
-/// Replays [`compute_reward_allocations`] over `events` and verifies that the
-/// result matches `expected` exactly (same sources, same amounts, same order).
-/// Returns `true` when the replay reproduces every allocation within the
-/// documented rounding rules.
-pub fn reconcile_reward_allocations(
-    env: &Env,
-    params: &RewardAttributionParams,
-    events: &Vec<RewardEvent>,
-    expected: &Vec<RewardAllocation>,
-) -> bool {
-    let replayed = compute_reward_allocations(env, params, events);
-    if replayed.len() != expected.len() {
-        return false;
-    }
-    for i in 0..replayed.len() {
-        let a = replayed.get(i).unwrap();
-        let b = expected.get(i).unwrap();
-        if a.source != b.source || a.amount != b.amount {
-            return false;
-        }
-    }
-    true
 }
