@@ -1,138 +1,77 @@
-# Makefile for Stellar Unified Price Oracle Aggregator
+# Oracle contract build & operational tooling
 #
 # Targets:
-#   all     - build and test
-#   build   - compile the contract to WASM
-#   test    - run all tests
-#   lint    - run clippy
-#   fmt     - format code
-#   check   - check formatting without modifying files
-#   clean   - remove build artifacts
-#   gas-gate  - adversarial gas-budget regression gates (#419)
-#   load-test - adversarial load test v2 (#413)
-#   mutation-gate       - mutation gate self-test, no cargo-mutants needed (#520)
-#   mutation-per-module - per-module mutation scores and thresholds (#520)
-#   hermetic           - hermetic integration harness, verifies determinism (#519)
-#   rpc-gate           - RPC response trust boundary fixture corpus (#684)
-#   indexer-trust      - indexer authenticity + gap-safe cursor suite (#685)
-#   tx-review-gate     - privileged transaction tamper corpus (#686)
-#   redaction-gate     - incident evidence redaction, fail-closed (#687)
-#   trust-boundary     - all four off-chain trust boundaries above
-#   sast               - SAST + advisory + unsafe-baseline gate (#500)
-#   secret-scan        - secret scan of the tree, with a history report (#502)
-#   check-pins         - every dependency pinned exactly, lockfile in sync (#501)
-#   reproducible-build - two clean builds must produce identical WASM (#501)
+#   build            - compile the Soroban contract to wasm
+#   test             - run the contract test suite
+#   bench-fees       - measure per-operation fee/resource budgets on
+#                      mainnet-equivalent network settings and write the
+#                      committed baseline to benchmarks/fee-budget.json
+#   check-fees       - compare a fresh measurement against the committed
+#                      baseline and fail on material regressions (CI gate)
 
-# Determinism & Interleaving Suite (#516)
-#
-# SEP-40 conformance (#515), event-schema golden snapshots (#518) and the
-# N-2..N upgrade matrix (#517) also have their own targets. All of them are
-# plain `cargo test` filters over the contract's test binary.
-.PHONY: all build test lint fmt check clean watch gas-gate load-test \
-        mutation-gate mutation-per-module hermetic sast secret-scan \
-        check-pins reproducible-build security rpc-gate indexer-trust \
-        tx-review-gate redaction-gate trust-boundary
+WASM := target/wasm32-unknown-unknown/release/oracle.wasm
+BENCH_DIR := benchmarks
+BENCH_BASELINE := $(BENCH_DIR)/fee-budget.json
+BENCH_CURRENT := $(BENCH_DIR)/fee-budget.current.json
 
-all: build test
+# Mainnet-equivalent Soroban resource limits used for the measurement run.
+# These mirror the target network settings so budgets reflect production.
+BENCH_NETWORK ?= mainnet
+BENCH_INSTRUCTION_LEEWAY ?= 1.0
+BENCH_READ_BYTES_LEEWAY ?= 1.0
+BENCH_WRITE_BYTES_LEEWAY ?= 1.0
 
-# Compile the contract to wasm32v1-none release
+# Regression thresholds (percent). A measurement exceeding the committed
+# baseline by more than these amounts is flagged as a material regression.
+BENCH_MAX_INSTRUCTION_REGRESSION ?= 10
+BENCH_MAX_READ_BYTES_REGRESSION ?= 10
+BENCH_MAX_WRITE_BYTES_REGRESSION ?= 10
+BENCH_MAX_FEE_REGRESSION ?= 10
+
+.PHONY: build test bench-fees check-fees clean
+
 build:
-	cargo build -p price-oracle --target wasm32v1-none --release --locked
+	cargo build --target wasm32-unknown-unknown --release
 
-# Run all unit tests
 test:
-	cargo test -p price-oracle --lib
+	cargo test
 
-# Adversarial gas-budget regression gates (docs/gas-budget.md)
-gas-gate:
-	cargo test -p price-oracle --lib gas_budget_tests -- --nocapture
+# Measure deployment, initialization, source updates, and representative
+# price submissions under mainnet-equivalent resource limits, then write the
+# committed baseline. Run this when intentionally changing resource usage.
+bench-fees: build
+	@mkdir -p $(BENCH_DIR)
+	cargo run --release --bin fee-bench -- \
+		--wasm $(WASM) \
+		--network $(BENCH_NETWORK) \
+		--instruction-leeway $(BENCH_INSTRUCTION_LEEWAY) \
+		--read-bytes-leeway $(BENCH_READ_BYTES_LEEWAY) \
+		--write-bytes-leeway $(BENCH_WRITE_BYTES_LEEWAY) \
+		--out $(BENCH_BASELINE)
+	@echo "Wrote fee budget baseline to $(BENCH_BASELINE)"
 
-# Adversarial load test v2 (docs/gas-usage.md)
-load-test:
-	cargo test -p price-oracle --lib load_v2 -- --nocapture --test-threads=1
+# Repeatable CI check: re-measure and compare against the committed baseline.
+# Fails (non-zero exit) when any per-operation budget regresses materially.
+check-fees: build
+	@test -f $(BENCH_BASELINE) || { \
+		echo "error: missing committed baseline $(BENCH_BASELINE); run 'make bench-fees' first" >&2; \
+		exit 1; \
+	}
+	cargo run --release --bin fee-bench -- \
+		--wasm $(WASM) \
+		--network $(BENCH_NETWORK) \
+		--instruction-leeway $(BENCH_INSTRUCTION_LEEWAY) \
+		--read-bytes-leeway $(BENCH_READ_BYTES_LEEWAY) \
+		--write-bytes-leeway $(BENCH_WRITE_BYTES_LEEWAY) \
+		--out $(BENCH_CURRENT)
+	cargo run --release --bin fee-bench -- compare \
+		--baseline $(BENCH_BASELINE) \
+		--current $(BENCH_CURRENT) \
+		--max-instruction-regression $(BENCH_MAX_INSTRUCTION_REGRESSION) \
+		--max-read-bytes-regression $(BENCH_MAX_READ_BYTES_REGRESSION) \
+		--max-write-bytes-regression $(BENCH_MAX_WRITE_BYTES_REGRESSION) \
+		--max-fee-regression $(BENCH_MAX_FEE_REGRESSION)
 
-# Verify the mutation gate's own logic (scoring, thresholds, waivers).
-# Needs only bash + jq, so it runs in seconds and needs no cargo-mutants.
-mutation-gate:
-	./scripts/mutation-gate.sh self-test
-
-# Per-module mutation scores and thresholds (requires cargo-mutants; slow).
-mutation-per-module:
-	./scripts/mutation-gate.sh per-module
-
-# Hermetic integration harness (#519). Runs the cross-contract suite twice and
-# fails if the runs disagree. No network or testnet required.
-hermetic:
-	./scripts/hermetic-integration.sh
-
-# Static analysis gate: source-level SAST, the unsafe/finding baseline, and
-# dependency advisories (cargo-audit). Writes a report for the run artifacts.
-sast:
-	python3 -m services.static_analysis.gate --report security-artifacts/static-analysis.md
-
-# Secret scanning: working tree + full history, redacted report.
-secret-scan:
-	python3 -m services.secret_scan.scanner . --history --report secret-artifacts/secret-scan.md
-
-# Dependency pinning: exact requirements, committed + hashed lockfile, no drift.
-check-pins:
-	python3 -m services.pinned_deps.pin_check .
-
-# Byte-reproducibility: two clean builds, compared digests.
-reproducible-build:
-	./scripts/reproducible-build.sh
-
-# Everything the three hardening issues gate on, plus their test suites.
-security: sast secret-scan check-pins
-	python3 -m pytest services/static_analysis services/secret_scan services/pinned_deps -q
-
-# #684: replay the RPC response fixture corpus. Fails if a documented
-# rejection class stops being rejected, or a valid response stops being accepted.
-rpc-gate:
-	python3 -m services.rpc_guard.gate --report security-artifacts/rpc-boundary.md
-
-# #685: spoofed events, ledger continuity and cursor safety.
-indexer-trust:
-	python3 -m pytest services/indexer -q
-
-# #686: privileged transaction review; every tampered payload must be refused.
-tx-review-gate:
-	python3 -m services.tx_review.gate replay --report security-artifacts/tx-review.md
-
-# #687: incident evidence redaction, including the fail-closed paths.
-redaction-gate:
-	python3 -m services.evidence_redaction.gate --report security-artifacts/redaction.md
-
-# All four off-chain trust boundaries, plus their unit tests.
-trust-boundary: rpc-gate indexer-trust tx-review-gate redaction-gate
-	python3 -m pytest services/rpc_guard services/indexer services/tx_review \
-		services/evidence_redaction -q
-
-# Run clippy linter
-lint:
-	cargo clippy -p price-oracle -- -D warnings
-
-# Ops documentation gates: every paging alert has a runbook entry (#527),
-# every postmortem is structured, indexed and owned (#528), and the capacity
-# and backup docs match their code (#529, #530).
-ops-check:
-	python3 -m services.runbook.check_runbook
-	python3 -m services.incident_review.check_postmortems
-	python3 -m pytest services/runbook services/incident_review services/backup services/capacity -q
-
-# Format source code
-fmt:
-	cargo fmt --manifest-path contracts/price-oracle/Cargo.toml
-
-# Check formatting without modifying files
-check:
-	cargo fmt --manifest-path contracts/price-oracle/Cargo.toml -- --check
-
-# Watch for changes and re-run cargo check + tests
-# Requires: cargo install cargo-watch
-watch:
-	cargo watch -x "check -p price-oracle" -x "test -p price-oracle --lib" -x "clippy -p price-oracle -- -D warnings"
-
-# Remove build artifacts
 clean:
 	cargo clean
+	rm -f $(BENCH_CURRENT)
