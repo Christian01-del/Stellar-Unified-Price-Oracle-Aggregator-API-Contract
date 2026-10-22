@@ -1,4 +1,5 @@
 //! # #454 — Admin key compromise: blast radius and recovery drill
+//! # #658 — Admin succession and unavailable-signer recovery
 //!
 //! Proves a compromised admin key cannot block its own revocation through
 //! the guardian recovery path, and scripts the recovery drill end to end.
