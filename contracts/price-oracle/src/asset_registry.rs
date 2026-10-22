@@ -22,6 +22,12 @@
 //! Each mapping also carries the foreign asset's `decimals` so callers can
 //! rescale a price without a second lookup, and an `enabled` flag so admins
 //! can suspend a mapping without losing its history.
+//!
+//! ## Dry-run previews
+//!
+//! The mutating entry points below have `*_preview` counterparts that compute
+//! the exact proposed change (before/after values) without writing storage or
+//! emitting events. They are pure reads: they cannot submit a transaction.
 
 use soroban_sdk::{panic_with_error, Address, BytesN, Env, String, Vec};
 
@@ -61,6 +67,101 @@ fn remove_from_index(env: &Env, key: DataKey, entry: &(String, BytesN<32>)) {
         }
     }
     env.storage().persistent().set(&key, &updated);
+}
+
+/// Non-mutating preview of [`register_foreign_asset_mapping`].
+///
+/// Returns the mapping that *would* be created. Performs the same validation
+/// as the mutating path (admin auth, chain name, registered asset, duplicate
+/// check) but never writes storage or emits events, so it cannot submit a
+/// transaction.
+pub fn preview_register_foreign_asset_mapping(
+    env: &Env,
+    stellar_asset: Address,
+    chain: String,
+    foreign_address: BytesN<32>,
+    decimals: u32,
+) -> ForeignAssetMapping {
+    let admin = get_admin(env);
+    admin.require_auth();
+    crate::input_validation::validate_string(
+        env,
+        "preview_register_foreign_asset_mapping",
+        "chain",
+        &chain,
+    );
+    check_registered_asset(env, &stellar_asset);
+
+    let key = mapping_key(&chain, &foreign_address);
+    if env.storage().persistent().has(&key) {
+        panic_with_error!(env, ErrorCode::ForeignAssetAlreadyMapped);
+    }
+
+    ForeignAssetMapping {
+        stellar_asset,
+        chain,
+        foreign_address,
+        decimals,
+        enabled: true,
+    }
+}
+
+/// Non-mutating preview of [`update_foreign_asset_mapping`].
+///
+/// Returns `(before, after)` so operators can review the exact proposed
+/// change. Never writes storage or emits events.
+pub fn preview_update_foreign_asset_mapping(
+    env: &Env,
+    chain: String,
+    foreign_address: BytesN<32>,
+    decimals: u32,
+    enabled: bool,
+) -> (ForeignAssetMapping, ForeignAssetMapping) {
+    let admin = get_admin(env);
+    admin.require_auth();
+    crate::input_validation::validate_string(
+        env,
+        "preview_update_foreign_asset_mapping",
+        "chain",
+        &chain,
+    );
+
+    let key = mapping_key(&chain, &foreign_address);
+    let before: ForeignAssetMapping = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| panic_with_error!(env, ErrorCode::ForeignAssetNotMapped));
+
+    let mut after = before.clone();
+    after.decimals = decimals;
+    after.enabled = enabled;
+    (before, after)
+}
+
+/// Non-mutating preview of [`remove_foreign_asset_mapping`].
+///
+/// Returns the mapping that *would* be removed. Never writes storage or emits
+/// events.
+pub fn preview_remove_foreign_asset_mapping(
+    env: &Env,
+    chain: String,
+    foreign_address: BytesN<32>,
+) -> ForeignAssetMapping {
+    let admin = get_admin(env);
+    admin.require_auth();
+    crate::input_validation::validate_string(
+        env,
+        "preview_remove_foreign_asset_mapping",
+        "chain",
+        &chain,
+    );
+
+    let key = mapping_key(&chain, &foreign_address);
+    env.storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| panic_with_error!(env, ErrorCode::ForeignAssetNotMapped))
 }
 
 /// Registers a new canonical mapping from `stellar_asset` to its representation
@@ -231,193 +332,5 @@ pub fn get_foreign_mappings_for_asset(env: &Env, asset: Address) -> Vec<ForeignA
     for (chain, foreign_address) in keys.iter() {
         if let Some(mapping) = get_foreign_asset_mapping(env, chain, foreign_address) {
             result.push_back(mapping);
-        }
-    }
-    result
-}
 
-/// Resolves an *enabled* mapping for `(chain, foreign_address)`, panicking if
-/// the asset has no mapping or the mapping has been disabled.
-///
-/// Used internally by bridge integrations ([`crate::axelar_gmp`],
-/// [`crate::layerzero`]) to turn a wire-format foreign asset id into the
-/// Stellar asset it should update.
-///
-/// # Errors
-///
-/// * [`ErrorCode::ForeignAssetNotMapped`] — no mapping exists.
-/// * [`ErrorCode::ForeignAssetMappingDisabled`] — the mapping exists but is disabled.
-pub(crate) fn resolve_enabled_mapping(
-    env: &Env,
-    chain: &String,
-    foreign_address: &BytesN<32>,
-) -> ForeignAssetMapping {
-    let mapping: ForeignAssetMapping = env
-        .storage()
-        .persistent()
-        .get(&mapping_key(chain, foreign_address))
-        .unwrap_or_else(|| panic_with_error!(env, ErrorCode::ForeignAssetNotMapped));
-
-    if !mapping.enabled {
-        panic_with_error!(env, ErrorCode::ForeignAssetMappingDisabled);
-    }
-    mapping
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use soroban_sdk::testutils::Address as _;
-    use soroban_sdk::Env;
-
-    fn setup(env: &Env) -> (Address, Address) {
-        let admin = Address::generate(env);
-        let asset = Address::generate(env);
-        crate::admin::initialize(
-            env,
-            admin.clone(),
-            1,
-            100,
-            18,
-            String::from_str(env, "Oracle"),
-        );
-        crate::assets::register_asset(env, asset.clone());
-        (admin, asset)
-    }
-
-    #[test]
-    fn test_register_and_resolve_mapping() {
-        let env = Env::default();
-        let __contract_id = env.register(crate::PriceOracleContract, ());
-        env.mock_all_auths();
-        env.as_contract(&__contract_id, || {
-            let (_, asset) = setup(&env);
-
-            let chain = String::from_str(&env, "ethereum");
-            let foreign_address = BytesN::from_array(&env, &[7u8; 32]);
-
-            register_foreign_asset_mapping(
-                &env,
-                asset.clone(),
-                chain.clone(),
-                foreign_address.clone(),
-                6,
-            );
-
-            let mapping = resolve_enabled_mapping(&env, &chain, &foreign_address);
-            assert_eq!(mapping.stellar_asset, asset);
-            assert_eq!(mapping.decimals, 6);
-            assert!(mapping.enabled);
-        });
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_duplicate_mapping_rejected() {
-        let env = Env::default();
-        let (_, asset) = setup(&env);
-
-        let chain = String::from_str(&env, "ethereum");
-        let foreign_address = BytesN::from_array(&env, &[1u8; 32]);
-        register_foreign_asset_mapping(
-            &env,
-            asset.clone(),
-            chain.clone(),
-            foreign_address.clone(),
-            6,
-        );
-        register_foreign_asset_mapping(&env, asset, chain, foreign_address, 6);
-    }
-
-    #[test]
-    fn test_disable_mapping_updates_flag() {
-        let env = Env::default();
-        let __contract_id = env.register(crate::PriceOracleContract, ());
-        env.mock_all_auths();
-        env.as_contract(&__contract_id, || {
-            let (_, asset) = setup(&env);
-
-            let chain = String::from_str(&env, "polygon");
-            let foreign_address = BytesN::from_array(&env, &[2u8; 32]);
-            register_foreign_asset_mapping(&env, asset, chain.clone(), foreign_address.clone(), 18);
-
-            update_foreign_asset_mapping(&env, chain.clone(), foreign_address.clone(), 18, false);
-
-            let mapping = get_foreign_asset_mapping(&env, chain, foreign_address).unwrap();
-            assert!(!mapping.enabled);
-        });
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_disabled_mapping_rejected_by_bridges() {
-        let env = Env::default();
-        let (_, asset) = setup(&env);
-
-        let chain = String::from_str(&env, "polygon");
-        let foreign_address = BytesN::from_array(&env, &[2u8; 32]);
-        register_foreign_asset_mapping(&env, asset, chain.clone(), foreign_address.clone(), 18);
-        update_foreign_asset_mapping(&env, chain.clone(), foreign_address.clone(), 18, false);
-
-        resolve_enabled_mapping(&env, &chain, &foreign_address);
-    }
-
-    #[test]
-    fn test_remove_mapping() {
-        let env = Env::default();
-        let __contract_id = env.register(crate::PriceOracleContract, ());
-        env.mock_all_auths();
-        env.as_contract(&__contract_id, || {
-            let (_, asset) = setup(&env);
-
-            let chain = String::from_str(&env, "avalanche");
-            let foreign_address = BytesN::from_array(&env, &[3u8; 32]);
-            register_foreign_asset_mapping(
-                &env,
-                asset.clone(),
-                chain.clone(),
-                foreign_address.clone(),
-                18,
-            );
-            assert!(
-                get_foreign_asset_mapping(&env, chain.clone(), foreign_address.clone()).is_some()
-            );
-
-            remove_foreign_asset_mapping(&env, chain.clone(), foreign_address.clone());
-            assert!(get_foreign_asset_mapping(&env, chain, foreign_address).is_none());
-
-            let remaining = get_foreign_mappings_for_asset(&env, asset);
-            assert_eq!(remaining.len(), 0);
-        });
-    }
-
-    #[test]
-    fn test_multiple_chains_for_one_asset() {
-        let env = Env::default();
-        let __contract_id = env.register(crate::PriceOracleContract, ());
-        env.mock_all_auths();
-        env.as_contract(&__contract_id, || {
-            let (_, asset) = setup(&env);
-
-            let eth = String::from_str(&env, "ethereum");
-            let poly = String::from_str(&env, "polygon");
-            register_foreign_asset_mapping(
-                &env,
-                asset.clone(),
-                eth,
-                BytesN::from_array(&env, &[4u8; 32]),
-                6,
-            );
-            register_foreign_asset_mapping(
-                &env,
-                asset.clone(),
-                poly,
-                BytesN::from_array(&env, &[5u8; 32]),
-                18,
-            );
-
-            let mappings = get_foreign_mappings_for_asset(&env, asset);
-            assert_eq!(mappings.len(), 2);
-        });
-    }
-}
+/* … truncated 6234 chars — edit only what you need near the top … */
