@@ -2,6 +2,10 @@
 //!
 //! Monitors for price deviations vs external references and triggers alerts
 //! when thresholds are exceeded. Supports multiple notification channels.
+//!
+//! Also provides source submission clock-skew monitoring (#647): source
+//! timestamps are compared against both the ledger timestamp and the observed
+//! submission time, with per-source configurable thresholds.
 
 use soroban_sdk::{Address, Env};
 
@@ -108,4 +112,132 @@ pub fn register_reference_oracle(env: &Env, asset: Address, reference_oracle: Ad
 pub fn get_last_alert_price(env: &Env, asset: &Address) -> i128 {
     let key = DataKey::AlertLastPrice(asset.clone());
     env.storage().persistent().get(&key).unwrap_or(0i128)
+}
+
+/// Per-source clock-skew thresholds, in seconds.
+///
+/// `ledger_tolerance_secs` bounds the difference between the source
+/// timestamp and the ledger timestamp. `submission_tolerance_secs` bounds the
+/// difference between the source timestamp and the observed submission time.
+#[derive(Clone, Copy)]
+pub struct SkewThresholds {
+    pub ledger_tolerance_secs: u64,
+    pub submission_tolerance_secs: u64,
+}
+
+/// Result of a clock-skew evaluation for a single source.
+#[derive(Clone, Copy)]
+pub struct SkewReport {
+    /// Absolute skew between source timestamp and ledger timestamp (secs).
+    pub ledger_skew_secs: u64,
+    /// Absolute skew between source timestamp and observed submission time (secs).
+    pub submission_skew_secs: u64,
+    /// Whether the ledger skew exceeded the configured threshold.
+    pub ledger_exceeded: bool,
+    /// Whether the submission skew exceeded the configured threshold.
+    pub submission_exceeded: bool,
+}
+
+impl SkewReport {
+    /// Returns `true` if any skew dimension exceeded its threshold.
+    pub fn exceeded(&self) -> bool {
+        self.ledger_exceeded || self.submission_exceeded
+    }
+}
+
+/// Stores the per-source clock-skew thresholds.
+pub fn set_skew_thresholds(env: &Env, source: Address, thresholds: SkewThresholds) {
+    let key = DataKey::SourceSkewThresholds(source.clone());
+    env.storage().persistent().set(&key, &thresholds);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, 300000, LEDGER_BUMP);
+}
+
+/// Returns the configured per-source clock-skew thresholds, if any.
+pub fn get_skew_thresholds(env: &Env, source: &Address) -> Option<SkewThresholds> {
+    let key = DataKey::SourceSkewThresholds(source.clone());
+    env.storage().persistent().get(&key)
+}
+
+/// Measures source timestamp skew against the ledger timestamp and the
+/// observed submission time, and emits a source-scoped alert when either
+/// exceeds the per-source threshold.
+///
+/// This is additive: it never suppresses or short-circuits other source
+/// health signals. Callers should continue to run their other checks
+/// regardless of the returned report.
+///
+/// # Arguments
+/// * `env` - Execution environment.
+/// * `source` - Source whose submission is being evaluated.
+/// * `source_timestamp` - Timestamp reported by the source (secs).
+/// * `observed_submission_time` - Timestamp observed when the submission was received (secs).
+///
+/// # Returns
+/// The computed [`SkewReport`]. When no thresholds are configured for the
+/// source, no alert is emitted and both `*_exceeded` flags are `false`.
+pub fn check_and_alert_clock_skew(
+    env: &Env,
+    source: Address,
+    source_timestamp: u64,
+    observed_submission_time: u64,
+) -> SkewReport {
+    let ledger_timestamp = env.ledger().timestamp();
+
+    let ledger_skew_secs = abs_diff_u64(source_timestamp, ledger_timestamp);
+    let submission_skew_secs = abs_diff_u64(source_timestamp, observed_submission_time);
+
+    let mut report = SkewReport {
+        ledger_skew_secs,
+        submission_skew_secs,
+        ledger_exceeded: false,
+        submission_exceeded: false,
+    };
+
+    if let Some(thresholds) = get_skew_thresholds(env, &source) {
+        report.ledger_exceeded = ledger_skew_secs > thresholds.ledger_tolerance_secs;
+        report.submission_exceeded =
+            submission_skew_secs > thresholds.submission_tolerance_secs;
+
+        if report.exceeded() {
+            record_clock_skew_alert(env, &source, &report, ledger_timestamp);
+        }
+    }
+
+    report
+}
+
+/// Records a source-scoped clock-skew alert for monitoring/indexing.
+fn record_clock_skew_alert(env: &Env, source: &Address, report: &SkewReport, ledger: u64) {
+    let key = DataKey::SourceSkewAlertLast(source.clone());
+    env.storage().persistent().set(&key, &ledger);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, 300000, LEDGER_BUMP);
+
+    crate::events::SourceClockSkewAlertEvent {
+        source: source.clone(),
+        ledger_skew_secs: report.ledger_skew_secs,
+        submission_skew_secs: report.submission_skew_secs,
+        ledger_exceeded: report.ledger_exceeded,
+        submission_exceeded: report.submission_exceeded,
+        ledger,
+    }
+    .publish(env);
+}
+
+/// Returns the ledger timestamp of the last clock-skew alert for a source, if any.
+pub fn get_last_clock_skew_alert(env: &Env, source: &Address) -> Option<u64> {
+    let key = DataKey::SourceSkewAlertLast(source.clone());
+    env.storage().persistent().get(&key)
+}
+
+/// Absolute difference between two `u64` values without underflow.
+fn abs_diff_u64(a: u64, b: u64) -> u64 {
+    if a >= b {
+        a - b
+    } else {
+        b - a
+    }
 }

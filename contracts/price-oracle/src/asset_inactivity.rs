@@ -5,6 +5,9 @@ use soroban_sdk::{symbol_short, Address, Env};
 /// Default global inactivity timeout: 0 = disabled.
 const DEFAULT_INACTIVITY_TIMEOUT: u32 = 0;
 
+/// Default per-source clock-skew threshold in seconds: 0 = disabled.
+const DEFAULT_SKEW_THRESHOLD: u64 = 0;
+
 // --- Configuration ---
 
 /// Sets the global default inactivity timeout in ledgers (admin only).
@@ -133,6 +136,107 @@ pub fn check_and_deregister_if_inactive(env: &Env, asset: Address) {
     }
 }
 
+// --- Clock-skew monitoring ---
+
+/// Sets the global default clock-skew threshold in seconds (admin only).
+/// 0 disables skew monitoring globally.
+pub fn set_skew_threshold(env: &Env, threshold_secs: u64) {
+    let admin = get_admin(env);
+    admin.require_auth();
+    env.storage()
+        .persistent()
+        .set(&DataKey::CfgSkewThreshold, &threshold_secs);
+    env.storage().persistent().extend_ttl(
+        &DataKey::CfgSkewThreshold,
+        LEDGER_THRESHOLD,
+        LEDGER_BUMP,
+    );
+}
+
+pub fn get_skew_threshold(env: &Env) -> u64 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::CfgSkewThreshold)
+        .unwrap_or(DEFAULT_SKEW_THRESHOLD)
+}
+
+/// Sets per-source clock-skew threshold override in seconds (admin only, 0 = use global).
+pub fn set_source_skew_threshold(env: &Env, source: Address, threshold_secs: u64) {
+    let admin = get_admin(env);
+    admin.require_auth();
+    let key = DataKey::SourceSkewThreshold(source.clone());
+    if threshold_secs == 0 {
+        env.storage().persistent().remove(&key);
+    } else {
+        env.storage().persistent().set(&key, &threshold_secs);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
+    }
+}
+
+pub fn get_source_skew_threshold(env: &Env, source: &Address) -> u64 {
+    let key = DataKey::SourceSkewThreshold(source.clone());
+    let per_source: Option<u64> = env.storage().persistent().get(&key);
+    match per_source {
+        Some(t) if t > 0 => {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
+            t
+        }
+        _ => get_skew_threshold(env),
+    }
+}
+
+/// Measures a source's submission timestamp skew against both the ledger
+/// timestamp and the observed submission time, emitting a source-scoped alert
+/// when either exceeds the configured per-source threshold.
+///
+/// Returns the maximum observed skew in seconds (0 when monitoring disabled).
+/// Skew alerts are emitted independently of other source health signals so
+/// they never suppress inactivity or other health events.
+pub fn check_source_skew(
+    env: &Env,
+    source: &Address,
+    source_timestamp: u64,
+    observed_submission_time: u64,
+) -> u64 {
+    let threshold = get_source_skew_threshold(env, source);
+    if threshold == 0 {
+        return 0; // monitoring disabled for this source
+    }
+
+    let ledger_time = env.ledger().timestamp();
+    let ledger_skew = abs_diff(source_timestamp, ledger_time);
+    let submission_skew = abs_diff(source_timestamp, observed_submission_time);
+    let max_skew = if ledger_skew > submission_skew {
+        ledger_skew
+    } else {
+        submission_skew
+    };
+
+    if max_skew > threshold {
+        emit_source_skew_alert(
+            env,
+            source,
+            ledger_skew,
+            submission_skew,
+            threshold,
+        );
+    }
+
+    max_skew
+}
+
+fn abs_diff(a: u64, b: u64) -> u64 {
+    if a >= b {
+        a - b
+    } else {
+        b - a
+    }
+}
+
 // --- Events ---
 
 fn emit_asset_inactivity_warning(env: &Env, asset: &Address, idle_ledgers: u32, timeout: u32) {
@@ -145,4 +249,17 @@ fn emit_asset_inactivity_warning(env: &Env, asset: &Address, idle_ledgers: u32, 
 fn emit_asset_auto_deregistered(env: &Env, asset: &Address, idle_ledgers: u32) {
     env.events()
         .publish((symbol_short!("auto_dreg"), asset.clone()), (idle_ledgers,));
+}
+
+fn emit_source_skew_alert(
+    env: &Env,
+    source: &Address,
+    ledger_skew: u64,
+    submission_skew: u64,
+    threshold: u64,
+) {
+    env.events().publish(
+        (symbol_short!("skew_alrt"), source.clone()),
+        (ledger_skew, submission_skew, threshold),
+    );
 }
