@@ -33,6 +33,8 @@ jobs:
         run: make lint
       - name: Gas-budget gates
         run: make gas-gate
+      - name: Per-endpoint budgets (#692)
+        run: make endpoint-budgets
       - name: Run tests
         run: make test
 
