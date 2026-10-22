@@ -1,4 +1,4 @@
-//! # Source Performance Analytics (#204)
+//! # Source Performance Analytics (#204, #547)
 //!
 //! Provides visibility into source performance metrics including accuracy, timeliness,
 //! uptime, and reputation trajectory over configurable rolling windows.
