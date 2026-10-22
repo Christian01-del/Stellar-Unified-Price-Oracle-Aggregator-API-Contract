@@ -4,6 +4,12 @@
 //! the guardian recovery path, and scripts the recovery drill end to end.
 //! The capability list and residual risk are documented in
 //! `docs/security/admin-compromise-drill.md`.
+//!
+//! # #641 — Source key rotation rehearsal
+//!
+//! Rehearses the staged source-key rotation runbook documented in
+//! `docs/operations/source-key-rotation.md`: submissions stay authorized
+//! through the planned transition and retired keys are rejected afterward.
 
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
@@ -164,6 +170,38 @@ fn recovery_drill_end_to_end() {
         .add_source(&honest, &String::from_str(&e, "Honest"));
     assert!(d.client.is_source(&honest));
     assert!(d.client.recovery_get_pending().is_none());
+}
+
+/// #641 — Staged source-key rotation rehearsal.
+///
+/// Mirrors the runbook in `docs/operations/source-key-rotation.md`:
+/// 1. Pre-checks: the outgoing key is an authorized source.
+/// 2. Staged rollout: the incoming key is added while the outgoing key stays
+///    authorized, so submissions from both remain valid during the overlap.
+/// 3. Authorization verification: both keys are recognized sources.
+/// 4. Retirement: the outgoing key is removed and rejected afterward.
+#[test]
+fn source_key_rotation_rehearsal() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _admin) = setup_contract(&e);
+
+    // 1. Pre-checks: outgoing key is an authorized source.
+    let old_key = register_test_source(&e, &client, "OldKey");
+    assert!(client.is_source(&old_key));
+
+    // 2. Staged rollout: add the incoming key without removing the old one.
+    let new_key = Address::generate(&e);
+    client.add_source(&new_key, &String::from_str(&e, "NewKey"));
+
+    // 3. Authorization verification: both keys authorized during overlap.
+    assert!(client.is_source(&old_key));
+    assert!(client.is_source(&new_key));
+
+    // 4. Retirement: remove the outgoing key; it is rejected afterward.
+    client.remove_source(&old_key);
+    assert!(!client.is_source(&old_key));
+    assert!(client.is_source(&new_key));
 }
 
 fn code(c: ErrorCode) -> soroban_sdk::Error {
