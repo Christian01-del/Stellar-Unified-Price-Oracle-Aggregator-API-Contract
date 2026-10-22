@@ -3,6 +3,9 @@
 //! Implements an append-only audit trail for all admin actions with cryptographic
 //! hash chain to prevent tampering. Each entry includes a SHA-256 hash of the
 //! previous entry, forming an immutable chain.
+//!
+//! Also provides incident evidence bundle collection (#651): a redacted,
+//! reproducible artifact of the audit trail for a source incident.
 
 use soroban_sdk::{panic_with_error, symbol_short, Address, Bytes, Env, Symbol, Vec};
 
@@ -234,4 +237,70 @@ pub fn get_audit_log_head(env: &Env) -> Bytes {
         .persistent()
         .get(&DataKey::AuditLogHead)
         .unwrap_or_else(|| Bytes::new(env))
+}
+
+/// Collect a redacted incident evidence bundle from the audit trail (#651).
+///
+/// Gathers the audit entries in `[from_id, to_id]` (inclusive) into a single
+/// reproducible artifact. Each entry contributes its id, action, timestamp,
+/// ledger, and hash-chain links so the incident can be replayed and verified
+/// with `verify_audit_chain`. The admin address and raw `data` payload are
+/// intentionally excluded so credentials and unrelated user data never leak
+/// into the bundle.
+///
+/// The bundle is prefixed with a header carrying the source version, the
+/// requested range, the current chain head, and whether the chain verifies.
+///
+/// # Arguments
+///
+/// * `env` - The Soroban execution environment.
+/// * `from_id` - First audit entry id to include (0 = start from the beginning).
+/// * `to_id` - Last audit entry id to include (0 = up to the current head).
+/// * `source_version` - The source version string to stamp into the bundle.
+///
+/// # Returns
+///
+/// A redacted `Bytes` artifact suitable for attaching to an incident report.
+pub fn collect_incident_bundle(
+    env: &Env,
+    from_id: u32,
+    to_id: u32,
+    source_version: Symbol,
+) -> Bytes {
+    let entry_count = get_audit_log_count(env);
+    let start_id = if from_id == 0 { 1 } else { from_id };
+    let end_id = if to_id == 0 { entry_count } else { to_id };
+
+    let mut bundle = Bytes::new(env);
+
+    // Header: magic tag, source version, range, head hash, chain validity.
+    bundle.append(&Bytes::from_slice(env, b"INCIDENT_BUNDLE_V1"));
+    bundle.append(&Bytes::from_slice(env, source_version.to_string().as_bytes()));
+    bundle.append(&Bytes::from_slice(env, &start_id.to_le_bytes()));
+    bundle.append(&Bytes::from_slice(env, &end_id.to_le_bytes()));
+    bundle.append(&get_audit_log_head(env));
+    bundle.append(&Bytes::from_slice(
+        env,
+        &[if verify_audit_chain(env) { 1u8 } else { 0u8 }],
+    ));
+
+    // Body: redacted per-entry records (no admin address, no raw data).
+    let mut i = start_id;
+    while i <= end_id && i <= entry_count {
+        if let Some(entry) = env
+            .storage()
+            .persistent()
+            .get::<_, AuditEntry>(&DataKey::AuditEntry(i))
+        {
+            bundle.append(&Bytes::from_slice(env, &entry.id.to_le_bytes()));
+            bundle.append(&Bytes::from_slice(env, entry.action.to_string().as_bytes()));
+            bundle.append(&Bytes::from_slice(env, &entry.timestamp.to_le_bytes()));
+            bundle.append(&Bytes::from_slice(env, &entry.ledger.to_le_bytes()));
+            bundle.append(&entry.previous_hash);
+            bundle.append(&entry.current_hash);
+        }
+        i += 1;
+    }
+
+    bundle
 }
