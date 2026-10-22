@@ -103,6 +103,49 @@ A **decentralized price oracle aggregator** built on Soroban (Stellar smart cont
 | `AdminChangedEvent` | `set_admin()` | old_admin, new_admin | — |
 | `ContractUpgradedEvent` | `upgrade()` | new_wasm_hash | — |
 
+## Contract Identity & Verification Registry
+
+Canonical deployments are recorded in a machine-readable registry at
+[`config/contract-registry.json`](config/contract-registry.json). Each entry
+records the network, the canonical contract ID, the deployed WASM hash, and the
+verification timestamp, so consumers can independently confirm that the on-chain
+contract matches the recorded release.
+
+### Registry format
+
+```json
+{
+  "schema_version": 1,
+  "entries": [
+    {
+      "network": "mainnet",
+      "contract_id": "CAAAA...",
+      "wasm_hash": "<64-char hex sha256 of the deployed WASM>",
+      "verified_at": "2025-01-01T00:00:00Z"
+    }
+  ]
+}
+```
+
+- `network` — `mainnet`, `testnet`, or `futurenet`
+- `contract_id` — the canonical Stellar contract address (`C...`)
+- `wasm_hash` — lowercase hex SHA-256 of the deployed WASM (64 hex chars)
+- `verified_at` — RFC 3339 UTC timestamp of the last verification
+
+### Verifying a deployment
+
+Use the repeatable check to resolve a contract ID and compare its on-chain WASM
+hash against the recorded release:
+
+```bash
+./scripts/verify-contract.sh --network mainnet --contract-id CAAAA...
+```
+
+The script exits non-zero and prints a clear error when the contract ID is not
+in the registry, the recorded hash is malformed, or the on-chain hash does not
+match the recorded release. Run it after every deploy or upgrade and in CI to
+keep the registry honest.
+
 ## oracle-cli
 
 `scripts/oracle-cli.sh` is a shell script plugin that wraps `stellar contract invoke` with
@@ -216,6 +259,10 @@ soroban contract deploy \
   --source <identity> \
   --network testnet
 ```
+
+After deploying, record the contract ID and WASM hash in
+`config/contract-registry.json` and run `./scripts/verify-contract.sh` to confirm
+the on-chain hash matches the recorded release.
 
 ## Project Structure
 
