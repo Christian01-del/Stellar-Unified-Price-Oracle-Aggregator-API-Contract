@@ -545,205 +545,59 @@ pub fn compute_source_reward(env: &Env, admin: &Address, from_id: u32, to_id: u3
     total
 }
 
-// ---------------------------------------------------------------------------
-// Public governance decision archive (#665)
-// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
 
-/// Current schema version of the public governance decision archive.
-///
-/// Bump this when the on-chain archive record layout changes so auditors can
-/// distinguish format revisions. Entries are immutable once published; a new
-/// schema version is recorded alongside each entry so historical records remain
-/// traceable across revisions.
-pub const GOVERNANCE_ARCHIVE_SCHEMA_VERSION: u32 = 1;
+    #[test]
+    fn resolving_appeal_appends_correction_without_overwriting_original() {
+        let env = Env::default();
+        env.mock_all_auths();
 
-/// Execution status of a published governance decision.
-///
-/// Encoded as a `u32` so it is stable across SDK versions and easy to filter.
-/// * `0` = Proposed (recorded, not yet executed)
-/// * `1` = Executed (on-chain result available)
-/// * `2` = Failed (execution attempted and reverted)
-/// * `3` = Cancelled (withdrawn before execution)
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum GovernanceDecisionStatus {
-    Proposed = 0,
-    Executed = 1,
-    Failed = 2,
-    Cancelled = 3,
-}
+        let admin = Address::generate(&env);
+        let source = Address::generate(&env);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Admin, &admin);
 
-impl GovernanceDecisionStatus {
-    pub fn as_u32(self) -> u32 {
-        self as u32
-    }
+        let reason = Bytes::from_slice(&env, b"payout undercounted");
+        let appeal_id = submit_reward_appeal(&env, source.clone(), 7, 1_000, reason.clone());
+        assert_eq!(appeal_id, 1);
 
-    pub fn from_u32(value: u32) -> Option<Self> {
-        match value {
-            0 => Some(Self::Proposed),
-            1 => Some(Self::Executed),
-            2 => Some(Self::Failed),
-            3 => Some(Self::Cancelled),
-            _ => None,
-        }
-    }
-}
-
-/// A single immutable entry in the public governance decision archive.
-///
-/// Contains everything an external auditor needs to trace a decision from
-/// proposal through on-chain result: the decision id, rationale, execution
-/// status, evidence links (e.g. proposal/transaction hashes), the ledger and
-/// timestamp at which it was recorded, and the schema version it was written
-/// under.
-#[derive(Clone)]
-pub struct GovernanceDecisionRecord {
-    pub id: u32,
-    pub schema_version: u32,
-    pub status: u32,
-    pub rationale: Bytes,
-    pub evidence: Bytes,
-    pub ledger: u32,
-    pub timestamp: u64,
-}
-
-/// Publish a governance decision to the public archive.
-///
-/// Entries are append-only and immutable: once an id is published it cannot be
-/// overwritten, guaranteeing a stable, versioned audit trail. The record is
-/// stamped with the current schema version and the ledger/timestamp at which it
-/// was published.
-///
-/// # Arguments
-///
-/// * `env` - The Soroban execution environment.
-/// * `id` - Unique decision id (must not already exist).
-/// * `status` - Execution status (see [`GovernanceDecisionStatus`]).
-/// * `rationale` - Human-readable rationale bytes.
-/// * `evidence` - Evidence links (proposal/transaction hashes, URLs, etc.).
-///
-/// # Panics
-///
-/// Panics with `ErrorCode::InvalidParameter` if `id` is zero, the status is
-/// unknown, or a decision with the same id has already been published.
-pub fn publish_governance_decision(
-    env: &Env,
-    id: u32,
-    status: u32,
-    rationale: Bytes,
-    evidence: Bytes,
-) {
-    if id == 0 || GovernanceDecisionStatus::from_u32(status).is_none() {
-        panic_with_error!(env, ErrorCode::InvalidParameter);
-    }
-
-    if env
-        .storage()
-        .persistent()
-        .has(&DataKey::GovernanceDecision(id))
-    {
-        // Immutable archive: reject attempts to overwrite an existing entry.
-        panic_with_error!(env, ErrorCode::InvalidParameter);
-    }
-
-    let record = GovernanceDecisionRecord {
-        id,
-        schema_version: GOVERNANCE_ARCHIVE_SCHEMA_VERSION,
-        status,
-        rationale,
-        evidence,
-        ledger: env.ledger().sequence(),
-        timestamp: env.ledger().timestamp(),
-    };
-
-    env.storage()
-        .persistent()
-        .set(&DataKey::GovernanceDecision(id), &record);
-
-    let count: u32 = env
-        .storage()
-        .persistent()
-        .get(&DataKey::GovernanceDecisionCount)
-        .unwrap_or(0);
-    env.storage()
-        .persistent()
-        .set(&DataKey::GovernanceDecisionCount, &(count + 1));
-}
-
-/// Fetch a single governance decision by id.
-///
-/// Returns `None` for unknown ids so callers can handle missing entries
-/// without panicking.
-pub fn get_governance_decision(env: &Env, id: u32) -> Option<GovernanceDecisionRecord> {
-    env.storage()
-        .persistent()
-        .get(&DataKey::GovernanceDecision(id))
-}
-
-/// Total number of published governance decisions.
-pub fn get_governance_decision_count(env: &Env) -> u32 {
-    env.storage()
-        .persistent()
-        .get(&DataKey::GovernanceDecisionCount)
-        .unwrap_or(0)
-}
-
-/// Paginated listing of governance decisions, optionally filtered by status.
-///
-/// Iterates ids in `[from_id, from_id + limit)` (or from 1 when `from_id == 0`),
-/// returning only entries whose status matches `status_filter` when provided.
-/// `limit` is capped at 500 to bound compute. Unknown ids are skipped, so the
-/// result may be shorter than `limit`.
-///
-/// # Arguments
-///
-/// * `env` - The Soroban execution environment.
-/// * `from_id` - Starting decision id (inclusive). Use 0 to start from the beginning.
-/// * `limit` - Maximum number of entries to return (0 = no limit, capped at 500).
-/// * `status_filter` - Optional status to filter by; `None` returns all statuses.
-pub fn list_governance_decisions(
-    env: &Env,
-    from_id: u32,
-    limit: u32,
-    status_filter: Option<u32>,
-) -> Vec<GovernanceDecisionRecord> {
-    let effective_limit = if limit == 0 || limit > 500 {
-        500
-    } else {
-        limit
-    };
-    let start_id = if from_id == 0 { 1 } else { from_id };
-    let end_id = start_id.saturating_add(effective_limit);
-
-    let mut results = Vec::new(env);
-    let mut i = start_id;
-    while i < end_id {
-        if let Some(record) = env
+        // Snapshot the original appeal record before resolution.
+        let original: AuditEntry = env
             .storage()
             .persistent()
-            .get::<_, GovernanceDecisionRecord>(&DataKey::GovernanceDecision(i))
-        {
-            let matches = match status_filter {
-                Some(s) => record.status == s,
-                None => true,
-            };
-            if matches {
-                results.push_back(record);
-            }
-        }
-        i += 1;
+            .get(&DataKey::AuditEntry(appeal_id))
+            .unwrap();
+
+        let note = Bytes::from_slice(&env, b"approved after review");
+        let correction_id = resolve_reward_appeal(&env, appeal_id, 1_500, note);
+        assert_eq!(correction_id, 2);
+
+        // Original appeal record is untouched.
+        let after: AuditEntry = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AuditEntry(appeal_id))
+            .unwrap();
+        assert_eq!(after.id, original.id);
+        assert_eq!(after.action, original.action);
+        assert_eq!(after.data, original.data);
+        assert_eq!(after.current_hash, original.current_hash);
+
+        // Correction is a distinct appended entry referencing the appeal.
+        let correction: AuditEntry = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AuditEntry(correction_id))
+            .unwrap();
+        assert_eq!(correction.action, symbol_short!("correct"));
+        assert_eq!(correction.previous_hash, original.current_hash);
+
+        // Chain remains valid with both records present.
+        assert!(verify_audit_chain(&env));
+        assert_eq!(get_audit_log_count(&env), 2);
     }
-
-    results
 }
-
-// ---------------------------------------------------------------------------
-// Governance participation and concentration guardrails (#662)
-// ---------------------------------------------------------------------------
-
-/// Transparent governance indicators computed from auditable audit records.
-///
-/// All values are expressed in basis points (0..=10_000) so they are
-/// deterministic, integer-only, and easy to compare against thresholds.
-///
-/// * `approval_concentration_bp
