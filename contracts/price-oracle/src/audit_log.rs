@@ -235,3 +235,118 @@ pub fn get_audit_log_head(env: &Env) -> Bytes {
         .get(&DataKey::AuditLogHead)
         .unwrap_or_else(|| Bytes::new(env))
 }
+
+/// Result of a governance event audit completeness check (#659).
+///
+/// Each variant identifies a specific class of governance audit failure so
+/// operators can distinguish a missing event from a malformed or unlinked one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GovernanceAuditFailure {
+    /// No failure detected; the cycle is complete and consistent.
+    None,
+    /// A privileged state change has no corresponding audit entry.
+    MissingEvent,
+    /// An audit entry exists but its action/admin/data is malformed.
+    MalformedEvent,
+    /// An audit entry is not linked to its predecessor (broken chain).
+    UnlinkedEvent,
+}
+
+/// Audit a single governance cycle for event completeness (#659).
+///
+/// Reconciles privileged state changes with their emitted governance events
+/// and approval records across an upgrade cycle. A cycle is described by the
+/// `expected_actions` that must each have exactly one matching audit entry,
+/// the `expected_admin` that must have authorized each entry, and the
+/// `approval_count` of approval records that must be present.
+///
+/// The check fails (returns a non-`None` failure) when:
+/// - a privileged state change has no matching audit entry (`MissingEvent`),
+/// - an audit entry is malformed (empty action, zero timestamp, or wrong
+///   admin) (`MalformedEvent`),
+/// - the audit chain is broken or an entry is unlinked from its predecessor
+///   (`UnlinkedEvent`),
+/// - the number of approval records does not match the number of privileged
+///   state changes (`MissingEvent`).
+///
+/// An empty cycle (no expected actions, no approvals) is considered complete.
+///
+/// # Arguments
+///
+/// * `env` - The Soroban execution environment.
+/// * `expected_actions` - Actions that must each appear in the audit log.
+/// * `expected_admin` - The admin that must have authorized each entry.
+/// * `approval_count` - Number of approval records recorded for the cycle.
+///
+/// # Returns
+///
+/// `GovernanceAuditFailure::None` when the cycle is complete and consistent.
+pub fn audit_governance_cycle(
+    env: &Env,
+    expected_actions: &Vec<Symbol>,
+    expected_admin: &Address,
+    approval_count: u32,
+) -> GovernanceAuditFailure {
+    // Empty cycle: nothing to reconcile, trivially complete.
+    if expected_actions.is_empty() && approval_count == 0 {
+        return GovernanceAuditFailure::None;
+    }
+
+    // The chain must be intact before we can trust any entry linkage.
+    if !verify_audit_chain(env) {
+        return GovernanceAuditFailure::UnlinkedEvent;
+    }
+
+    let entry_count = get_audit_log_count(env);
+
+    // Every privileged state change must have a matching approval record.
+    if approval_count != expected_actions.len() {
+        return GovernanceAuditFailure::MissingEvent;
+    }
+
+    // Collect the actions actually present in the audit log.
+    let mut seen: Vec<Symbol> = Vec::new(env);
+    for i in 1..=entry_count {
+        let entry: AuditEntry = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::AuditEntry(i))
+        {
+            Some(e) => e,
+            None => return GovernanceAuditFailure::MissingEvent,
+        };
+
+        // Malformed: empty action, zero timestamp, or wrong authorizing admin.
+        if entry.action == symbol_short!("")
+            || entry.timestamp == 0
+            || entry.admin != *expected_admin
+        {
+            return GovernanceAuditFailure::MalformedEvent;
+        }
+
+        // Unlinked: entry id must be sequential and previous hash must match
+        // the prior entry's current hash (already validated by chain check,
+        // but re-assert the id linkage explicitly).
+        if entry.id != i {
+            return GovernanceAuditFailure::UnlinkedEvent;
+        }
+
+        seen.push_back(entry.action.clone());
+    }
+
+    // Every expected action must be present in the audit log.
+    for expected in expected_actions.iter() {
+        let mut found = false;
+        for action in seen.iter() {
+            if action == expected {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return GovernanceAuditFailure::MissingEvent;
+        }
+    }
+
+    GovernanceAuditFailure::None
+}
