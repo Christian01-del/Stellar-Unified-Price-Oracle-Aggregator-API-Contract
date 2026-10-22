@@ -294,3 +294,6 @@ See [docs/SLA.md](docs/SLA.md) for price freshness guarantees, uptime commitment
 
 <!-- handsoff-issue-672 -->
 - #672: [Economics] Fee and reward parameter sensitivity analysis
+
+<!-- handsoff-issue-673 -->
+- #673: [Economics] Economic emergency reserve policy
