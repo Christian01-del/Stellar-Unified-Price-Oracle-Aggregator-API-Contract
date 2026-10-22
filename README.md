@@ -1,56 +1,41 @@
-# Stellar Unified Price Oracle Aggregator
+# Price Oracle
 
-A **decentralized price oracle aggregator** built on Soroban (Stellar smart contracts). Collects price data from multiple permissioned oracle sources, aggregates via **median**, and exposes historical price data for consumer contracts.
+A Soroban-based price oracle for Stellar. This document covers the operator-facing
+runbook, including the incident severity and decision authority matrix.
 
-## Features
+## Incident severity and decision authority matrix
 
-- **Multi-source aggregation** — register multiple oracle sources per asset, aggregate via median
-- **Admin governance** — admin controls sources, assets, decimals, description, history limits
-- **Median price** — robust single-statistic aggregation resistant to outliers and manipulation
-- **Per-source prices** — inspect individual source submissions for transparency
-- **Historical prices** — ledger-based price history with configurable retention
-- **Contract upgradability** — WASM-based upgrade mechanism
-- **SEP-40 compliant** — full implementation of the Stellar Oracle Consumer Interface standard
-- **Contract events** — all state changes emit on-chain events for indexers and monitoring
-- **27 public endpoints** — full admin, source, asset, submission, query, history, and SEP-40 interface
+Oracle impact levels map to response roles, pause authority, communications, and
+escalation deadlines. Use the highest severity that applies.
 
-## Contract Interface
+| Severity | Oracle impact | Incident commander | Pause authority | Communications | Escalation deadline |
+| --- | --- | --- | --- | --- | --- |
+| SEV1 | Stale or manipulated prices served on-chain; funds at risk | On-call lead + protocol maintainer | On-call lead may pause immediately; maintainer confirms within 15 min | Public status page + consumer notice within 30 min | Acknowledge in 5 min; escalate to maintainers in 15 min |
+| SEV2 | Degraded feeds, partial asset coverage, or delayed updates | On-call lead | On-call lead may pause affected assets | Consumer notice within 1 hour | Acknowledge in 15 min; escalate in 1 hour |
+| SEV3 | Single asset anomaly with fallback intact | On-call engineer | On-call engineer may pause the single asset | Internal channel notice within 4 hours | Acknowledge in 1 hour; escalate in 4 hours |
+| SEV4 | Cosmetic or non-impacting issue | On-call engineer | No pause authority required | Logged in incident tracker | Triage within 1 business day |
 
-### Admin
+### Decision authority rules
 
-| Function | Description |
-|----------|-------------|
-| `initialize(admin, min_sources, max_history, decimals, description)` | Initialize the contract |
-| `set_admin(new_admin)` | Transfer admin rights |
-| `get_admin_address()` | Get current admin |
-| `set_min_sources_required(n)` | Set minimum sources for aggregation |
-| `get_min_sources_required()` | Get minimum sources required |
-| `set_max_history_length(n)` | Set max historical records per asset |
-| `get_max_history_length()` | Get max history length |
-| `set_decimals(n)` | Set price decimals |
-| `get_decimals()` | Get decimals |
-| `set_description(s)` | Set contract description |
-| `get_description()` | Get description |
-| `upgrade(new_wasm_hash)` | Upgrade contract WASM |
+- Only the roles listed for a severity may pause the oracle or an asset.
+- Pausing above the listed authority requires incident-commander approval.
+- Every pause must be recorded with severity, role, timestamp, and rationale.
+- Resuming requires the same authority that paused, plus a post-incident review.
 
-### Source Management
+## Tabletop exercise
 
-| Function | Description |
-|----------|-------------|
-| `add_source(address, name)` | Register an oracle source |
-| `remove_source(address)` | Remove an oracle source |
-| `is_source(address) -> bool` | Check if address is a registered source |
-| `get_oracle_sources() -> OracleSources` | Get all registered sources |
+The severity matrix is verified by a repeatable tabletop check. For each severity,
+walk the scenario and confirm:
 
-### Asset Management
+1. The correct incident commander and pause authority are identified.
+2. The communications requirement and channel are met within the stated window.
+3. The escalation deadline is respected.
 
-| Function | Description |
-|----------|-------------|
-| `register_asset(asset)` | Register a new asset |
-| `unregister_asset(asset)` | Unregister an asset |
-| `is_asset_registered(asset) -> bool` | Check if asset is registered |
+Run the tabletop before each release and after any incident. Record the outcome in
+the incident tracker; a severity with no correct decision-maker or response path
+fails the check and blocks release.
 
-### Price Submission
+## Development
 
 | Function | Description |
 |----------|-------------|

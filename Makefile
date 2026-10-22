@@ -1,4 +1,4 @@
-# Makefile for Stellar Unified Price Oracle Aggregator
+# Oracle contract build & operational tooling
 #
 # Targets:
 #   all     - build and test
@@ -42,9 +42,8 @@ all: build test
 
 # Compile the contract to wasm32v1-none release
 build:
-	cargo build -p price-oracle --target wasm32v1-none --release --locked
+	cargo build --target wasm32-unknown-unknown --release
 
-# Run all unit tests
 test:
 	cargo test -p price-oracle --lib
 
@@ -154,6 +153,6 @@ check:
 watch:
 	cargo watch -x "check -p price-oracle" -x "test -p price-oracle --lib" -x "clippy -p price-oracle -- -D warnings"
 
-# Remove build artifacts
 clean:
 	cargo clean
+	rm -f $(BENCH_CURRENT)
