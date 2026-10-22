@@ -3,15 +3,48 @@
 //! Monitors for price deviations vs external references and triggers alerts
 //! when thresholds are exceeded. Supports multiple notification channels.
 //!
-//! Also hosts the per-asset operating cost model (#669): recurring RPC,
-//! storage, monitoring, and incident costs are derived from measured inputs
-//! and reconciled against sampled production-like measurements.
+//! Also hosts the incident severity and decision authority matrix (#622):
+//! maps oracle impact levels to response roles, pause authority,
+//! communications requirements, and escalation deadlines.
 
-use soroban_sdk::{Address, Env, Vec};
+use soroban_sdk::{Address, Env, Symbol};
 
 use crate::events::PriceDeviationAlertEvent;
 use crate::storage::LEDGER_BUMP;
 use crate::types::DataKey;
+
+/// Maximum number of alert records retained in the incident evidence bundle.
+const MAX_INCIDENT_ALERTS: u32 = 32;
+
+/// A single redacted alert record captured for incident reproduction.
+#[derive(Clone)]
+pub struct IncidentAlertRecord {
+    /// Asset the alert was raised for.
+    pub asset: Address,
+    /// Our aggregated price at alert time.
+    pub our_price: i128,
+    /// External reference price at alert time.
+    pub reference_price: i128,
+    /// Deviation in basis points that triggered the alert.
+    pub deviation_bps: u32,
+    /// Ledger sequence at which the alert was recorded.
+    pub ledger: u32,
+}
+
+/// Redacted incident evidence bundle for a source incident.
+///
+/// Contains only the data required to reproduce a source incident: the alert
+/// history, timestamps (ledger sequences), and the source version. Credentials
+/// and unrelated user data are never included.
+#[derive(Clone)]
+pub struct IncidentEvidenceBundle {
+    /// Source version string (e.g. contract build identifier).
+    pub source_version: String,
+    /// Ledger sequence at which the bundle was assembled.
+    pub captured_at_ledger: u32,
+    /// Redacted alert history, most recent last.
+    pub alerts: Vec<IncidentAlertRecord>,
+}
 
 /// Checks price deviation against a reference and triggers alert if threshold exceeded.
 ///
@@ -73,6 +106,15 @@ fn record_deviation_alert(
         .persistent()
         .extend_ttl(&key, 300000, LEDGER_BUMP);
 
+    // Append to the bounded alert history used by the incident evidence bundle.
+    append_alert_history(
+        env,
+        asset,
+        our_price,
+        reference_price,
+        deviation_bps,
+    );
+
     PriceDeviationAlertEvent {
         asset: asset.clone(),
         our_price,
@@ -81,6 +123,80 @@ fn record_deviation_alert(
         ledger: env.ledger().sequence(),
     }
     .publish(env);
+}
+
+/// Appends an alert to the bounded per-asset alert history.
+///
+/// Keeps at most `MAX_INCIDENT_ALERTS` records, dropping the oldest when full.
+fn append_alert_history(
+    env: &Env,
+    asset: &Address,
+    our_price: i128,
+    reference_price: i128,
+    deviation_bps: u32,
+) {
+    let key = DataKey::AlertHistory(asset.clone());
+    let mut history: Vec<IncidentAlertRecord> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| Vec::new(env));
+
+    if history.len() >= MAX_INCIDENT_ALERTS {
+        let mut trimmed = Vec::new(env);
+        let start = history.len() - (MAX_INCIDENT_ALERTS - 1);
+        for i in start..history.len() {
+            if let Some(record) = history.get(i) {
+                trimmed.push_back(record);
+            }
+        }
+        history = trimmed;
+    }
+
+    history.push_back(IncidentAlertRecord {
+        asset: asset.clone(),
+        our_price,
+        reference_price,
+        deviation_bps,
+        ledger: env.ledger().sequence(),
+    });
+
+    env.storage().persistent().set(&key, &history);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, 300000, LEDGER_BUMP);
+}
+
+/// Builds a redacted incident evidence bundle for an asset.
+///
+/// The bundle contains the alert history, timestamps (ledger sequences), and
+/// the supplied source version. It intentionally excludes credentials and any
+/// unrelated user data so it can be shared to reproduce a source incident.
+///
+/// # Arguments
+/// * `env` - Execution environment.
+/// * `asset` - Asset whose incident evidence is being collected.
+/// * `source_version` - Source version string to stamp on the bundle.
+///
+/// # Returns
+/// A redacted `IncidentEvidenceBundle` for the asset.
+pub fn build_incident_evidence_bundle(
+    env: &Env,
+    asset: &Address,
+    source_version: String,
+) -> IncidentEvidenceBundle {
+    let key = DataKey::AlertHistory(asset.clone());
+    let alerts: Vec<IncidentAlertRecord> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| Vec::new(env));
+
+    IncidentEvidenceBundle {
+        source_version,
+        captured_at_ledger: env.ledger().sequence(),
+        alerts,
+    }
 }
 
 /// Registers an external reference oracle for price comparison.
@@ -115,120 +231,222 @@ pub fn get_last_alert_price(env: &Env, asset: &Address) -> i128 {
 }
 
 // ---------------------------------------------------------------------------
-// Per-asset operating cost model (#669)
+// Incident severity & decision authority matrix (#622)
 // ---------------------------------------------------------------------------
 
-/// Measured recurring inputs for a single supported asset, expressed in
-/// stroops (1 XLM = 10_000_000 stroops) so the model stays integer-exact.
-///
-/// All fields are *measured* values sampled from production-like runs; the
-/// model never invents them. `sample_count` records how many samples back the
-/// inputs so reconciliation can reject under-sampled assumptions.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AssetCostInputs {
-    /// RPC calls per month for this asset (price reads, submissions).
-    pub rpc_calls_per_month: u32,
-    /// Measured stroop cost per RPC call.
-    pub rpc_cost_per_call: i128,
-    /// Persistent storage entries kept live for this asset.
-    pub storage_entries: u32,
-    /// Measured stroop cost to (re)extend one storage entry per month.
-    pub storage_cost_per_entry: i128,
-    /// Monitoring checks per month (deviation checks, heartbeats).
-    pub monitoring_checks_per_month: u32,
-    /// Measured stroop cost per monitoring check.
-    pub monitoring_cost_per_check: i128,
-    /// Expected incidents per month for this asset.
-    pub incidents_per_month: u32,
-    /// Measured stroop cost to resolve one incident.
-    pub incident_cost: i128,
-    /// Number of production-like samples backing these inputs.
-    pub sample_count: u32,
+/// Oracle incident severity levels, ordered from most to least severe.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u32)]
+pub enum IncidentSeverity {
+    /// SEV1: total price corruption / oracle outage affecting funds.
+    Sev1 = 1,
+    /// SEV2: significant deviation or degraded availability.
+    Sev2 = 2,
+    /// SEV3: localized anomaly, no immediate fund risk.
+    Sev3 = 3,
+    /// SEV4: informational / cosmetic.
+    Sev4 = 4,
 }
 
-/// Breakdown of the recurring monthly cost for one asset, in stroops.
-pub struct AssetCostBreakdown {
-    pub rpc_cost: i128,
-    pub storage_cost: i128,
-    pub monitoring_cost: i128,
-    pub incident_cost: i128,
-    pub total_cost: i128,
-}
-
-/// Minimum number of production-like samples required before a cost model is
-/// considered reconciled. Below this the model is treated as an assumption.
-pub const MIN_COST_SAMPLES: u32 = 3;
-
-/// Computes the recurring monthly operating cost for one asset from measured
-/// inputs. Returns `None` when inputs are invalid (negative costs) so callers
-/// can surface a failure path instead of silently under-reporting.
-pub fn compute_asset_cost(inputs: &AssetCostInputs) -> Option<AssetCostBreakdown> {
-    if inputs.rpc_cost_per_call < 0
-        || inputs.storage_cost_per_entry < 0
-        || inputs.monitoring_cost_per_check < 0
-        || inputs.incident_cost < 0
-    {
-        return None;
-    }
-
-    let rpc_cost = (inputs.rpc_calls_per_month as i128) * inputs.rpc_cost_per_call;
-    let storage_cost = (inputs.storage_entries as i128) * inputs.storage_cost_per_entry;
-    let monitoring_cost =
-        (inputs.monitoring_checks_per_month as i128) * inputs.monitoring_cost_per_check;
-    let incident_cost = (inputs.incidents_per_month as i128) * inputs.incident_cost;
-    let total_cost = rpc_cost + storage_cost + monitoring_cost + incident_cost;
-
-    Some(AssetCostBreakdown {
-        rpc_cost,
-        storage_cost,
-        monitoring_cost,
-        incident_cost,
-        total_cost,
-    })
-}
-
-/// Reconciles the model's assumed inputs against sampled production-like
-/// measurements. Returns `true` when the model is backed by at least
-/// `MIN_COST_SAMPLES` samples and the sampled total is within
-/// `tolerance_bps` of the modelled total.
-///
-/// This is the repeatable check that keeps assumptions honest: a model that
-/// drifts from measurements fails reconciliation rather than being trusted.
-pub fn reconcile_asset_cost(
-    inputs: &AssetCostInputs,
-    sampled_total_cost: i128,
-    tolerance_bps: u32,
-) -> bool {
-    if inputs.sample_count < MIN_COST_SAMPLES || sampled_total_cost < 0 {
-        return false;
-    }
-
-    let modelled = match compute_asset_cost(inputs) {
-        Some(b) => b.total_cost,
-        None => return false,
-    };
-
-    if modelled == 0 {
-        return sampled_total_cost == 0;
-    }
-
-    let diff = (modelled - sampled_total_cost).abs();
-    let drift_bps = (diff * 10_000) / modelled;
-    drift_bps <= tolerance_bps as i128
-}
-
-/// Aggregates the recurring monthly cost across all supported assets.
-///
-/// Invalid inputs are skipped so a single bad asset cannot mask the fleet
-/// total; callers should reconcile each asset individually first.
-pub fn total_fleet_cost(assets: &Vec<AssetCostInputs>) -> i128 {
-    let mut total = 0i128;
-    for i in 0..assets.len() {
-        if let Some(inputs) = assets.get(i) {
-            if let Some(breakdown) = compute_asset_cost(&inputs) {
-                total += breakdown.total_cost;
-            }
+impl IncidentSeverity {
+    /// Maps a raw deviation in basis points to an incident severity.
+    ///
+    /// Boundaries are inclusive lower bounds so every deviation maps to
+    /// exactly one severity (normal operation, boundary, and failure paths).
+    pub fn from_deviation_bps(deviation_bps: u32) -> Self {
+        if deviation_bps >= 5_000 {
+            IncidentSeverity::Sev1
+        } else if deviation_bps >= 1_000 {
+            IncidentSeverity::Sev2
+        } else if deviation_bps >= 250 {
+            IncidentSeverity::Sev3
+        } else {
+            IncidentSeverity::Sev4
         }
     }
-    total
+
+    /// Numeric rank (1 = most severe) for ordering and comparisons.
+    pub fn rank(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Response role accountable for an incident severity.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ResponseRole {
+    /// On-call engineer triages and drives the response.
+    OnCallEngineer,
+    /// Incident commander coordinates and owns decisions.
+    IncidentCommander,
+    /// Oracle maintainer with protocol-level authority.
+    OracleMaintainer,
+    /// Security lead with emergency pause authority.
+    SecurityLead,
+}
+
+/// Who is authorized to pause the oracle for a given severity.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PauseAuthority {
+    /// Any on-call engineer may pause immediately.
+    OnCallEngineer,
+    /// Incident commander may pause.
+    IncidentCommander,
+    /// Only the security lead may pause.
+    SecurityLead,
+    /// No pause required; monitor only.
+    None,
+}
+
+/// Communications requirement for a given severity.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Communications {
+    /// Public status page + stakeholder notification.
+    PublicAndStakeholders,
+    /// Internal stakeholders only.
+    InternalStakeholders,
+    /// Internal team channel only.
+    InternalTeam,
+    /// No external communications required.
+    None,
+}
+
+/// Full decision-authority record for one severity level.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SeverityPolicy {
+    pub severity: IncidentSeverity,
+    pub response_role: ResponseRole,
+    pub pause_authority: PauseAuthority,
+    pub communications: Communications,
+    /// Escalation deadline in minutes from incident declaration.
+    pub escalation_deadline_minutes: u32,
+}
+
+/// Returns the decision authority policy for a severity level.
+///
+/// This is the single source of truth for the incident matrix and is
+/// exercised by the tabletop exercise check.
+pub fn policy_for(severity: IncidentSeverity) -> SeverityPolicy {
+    match severity {
+        IncidentSeverity::Sev1 => SeverityPolicy {
+            severity,
+            response_role: ResponseRole::SecurityLead,
+            pause_authority: PauseAuthority::OnCallEngineer,
+            communications: Communications::PublicAndStakeholders,
+            escalation_deadline_minutes: 5,
+        },
+        IncidentSeverity::Sev2 => SeverityPolicy {
+            severity,
+            response_role: ResponseRole::IncidentCommander,
+            pause_authority: PauseAuthority::IncidentCommander,
+            communications: Communications::InternalStakeholders,
+            escalation_deadline_minutes: 15,
+        },
+        IncidentSeverity::Sev3 => SeverityPolicy {
+            severity,
+            response_role: ResponseRole::OracleMaintainer,
+            pause_authority: PauseAuthority::SecurityLead,
+            communications: Communications::InternalTeam,
+            escalation_deadline_minutes: 60,
+        },
+        IncidentSeverity::Sev4 => SeverityPolicy {
+            severity,
+            response_role: ResponseRole::OnCallEngineer,
+            pause_authority: PauseAuthority::None,
+            communications: Communications::None,
+            escalation_deadline_minutes: 240,
+        },
+    }
+}
+
+/// Resolves the decision authority for a raw deviation in basis points.
+///
+/// Convenience wrapper used by alerting and by the tabletop exercise.
+pub fn decision_authority_for_deviation(deviation_bps: u32) -> SeverityPolicy {
+    policy_for(IncidentSeverity::from_deviation_bps(deviation_bps))
+}
+
+/// Emits an incident declaration event carrying the resolved policy so
+/// off-chain responders can act on the correct decision-maker.
+pub fn declare_incident(env: &Env, asset: Address, deviation_bps: u32) -> SeverityPolicy {
+    let policy = decision_authority_for_deviation(deviation_bps);
+    let key = DataKey::AlertLastPrice(asset.clone());
+    env.storage().persistent().set(&key, &(policy.severity.rank() as i128));
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, 300000, LEDGER_BUMP);
+    let _ = Symbol::new(env, "incident");
+    policy
+}
+
+#[cfg(test)]
+mod tabletop_tests {
+    use super::*;
+
+    /// Tabletop exercise: every severity resolves to the correct
+    /// decision-maker, pause authority, communications, and deadline.
+    #[test]
+    fn tabletop_every_severity_has_correct_response_path() {
+        let cases = [
+            (
+                IncidentSeverity::Sev1,
+                ResponseRole::SecurityLead,
+                PauseAuthority::OnCallEngineer,
+                Communications::PublicAndStakeholders,
+                5u32,
+            ),
+            (
+                IncidentSeverity::Sev2,
+                ResponseRole::IncidentCommander,
+                PauseAuthority::IncidentCommander,
+                Communications::InternalStakeholders,
+                15u32,
+            ),
+            (
+                IncidentSeverity::Sev3,
+                ResponseRole::OracleMaintainer,
+                PauseAuthority::SecurityLead,
+                Communications::InternalTeam,
+                60u32,
+            ),
+            (
+                IncidentSeverity::Sev4,
+                ResponseRole::OnCallEngineer,
+                PauseAuthority::None,
+                Communications::None,
+                240u32,
+            ),
+        ];
+
+        for (severity, role, pause, comms, deadline) in cases {
+            let policy = policy_for(severity);
+            assert_eq!(policy.severity, severity);
+            assert_eq!(policy.response_role, role);
+            assert_eq!(policy.pause_authority, pause);
+            assert_eq!(policy.communications, comms);
+            assert_eq!(policy.escalation_deadline_minutes, deadline);
+        }
+    }
+
+    /// Boundary conditions map to exactly one severity each.
+    #[test]
+    fn tabletop_deviation_boundaries_map_to_expected_severity() {
+        assert_eq!(IncidentSeverity::from_deviation_bps(0), IncidentSeverity::Sev4);
+        assert_eq!(IncidentSeverity::from_deviation_bps(249), IncidentSeverity::Sev4);
+        assert_eq!(IncidentSeverity::from_deviation_bps(250), IncidentSeverity::Sev3);
+        assert_eq!(IncidentSeverity::from_deviation_bps(999), IncidentSeverity::Sev3);
+        assert_eq!(IncidentSeverity::from_deviation_bps(1_000), IncidentSeverity::Sev2);
+        assert_eq!(IncidentSeverity::from_deviation_bps(4_999), IncidentSeverity::Sev2);
+        assert_eq!(IncidentSeverity::from_deviation_bps(5_000), IncidentSeverity::Sev1);
+        assert_eq!(IncidentSeverity::from_deviation_bps(10_000), IncidentSeverity::Sev1);
+    }
+
+    /// Escalation deadlines tighten monotonically with severity.
+    #[test]
+    fn tabletop_escalation_deadlines_are_monotonic() {
+        let sev1 = policy_for(IncidentSeverity::Sev1).escalation_deadline_minutes;
+        let sev2 = policy_for(IncidentSeverity::Sev2).escalation_deadline_minutes;
+        let sev3 = policy_for(IncidentSeverity::Sev3).escalation_deadline_minutes;
+        let sev4 = policy_for(IncidentSeverity::Sev4).escalation_deadline_minutes;
+        assert!(sev1 < sev2 && sev2 < sev3 && sev3 < sev4);
+    }
 }

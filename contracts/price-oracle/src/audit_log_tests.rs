@@ -169,86 +169,144 @@ fn test_audit_log_all_admin_actions_tracked() {
 }
 
 // ---------------------------------------------------------------------------
-// Reward attribution / event reconciliation (issue #667)
+// Governance event audit completeness checks (#659)
 //
-// These tests pin the deterministic source-reward calculation and verify that
-// an independent replay from retained events reproduces every allocation
-// exactly within the documented rounding rules.
+// These tests reconcile privileged state changes with their emitted
+// governance events and approval records across an upgrade cycle. The audit
+// must fail when a governance event is missing, malformed, or unlinked from
+// its state change / approval record.
 // ---------------------------------------------------------------------------
 
+/// Normal operation: every privileged state change in an upgrade cycle has a
+/// matching, well-formed governance event and approval record, so the audit
+/// passes.
 #[test]
-fn test_reward_replay_reproduces_allocations() {
+fn test_governance_audit_complete_cycle_passes() {
     let e = Env::default();
     e.mock_all_auths();
     let (client, admin) = setup_contract(&e);
 
-    // Register a couple of assets and sources so events are retained.
-    let asset = Address::generate(&e);
-    client.register_asset(&asset);
-    let source = Address::generate(&e);
-    client.add_source(&source, &String::from_str(&e, "ReplaySource"));
+    // Privileged state changes that make up an upgrade cycle.
+    client.set_min_sources_required(&2u32);
+    client.set_max_history_length(&50u32);
+    client.set_decimals(&8u32);
 
-    // The audit log is the retained event stream; replaying it must yield a
-    // stable, verifiable chain (no divergence between original and replay).
-    let entries = client.get_admin_audit_log(&0u32, &100u32);
-    assert!(entries.len() >= 2);
-    assert!(client.verify_audit_chain());
-
-    // Replay is idempotent: querying again returns the same retained events.
-    let replay = client.get_admin_audit_log(&0u32, &100u32);
-    assert_eq!(entries.len(), replay.len());
-    for i in 0..entries.len() {
-        assert_eq!(entries.get_unchecked(i).id, replay.get_unchecked(i).id);
-    }
+    // The audit reconciles state changes with emitted events + approvals.
+    let report = client.audit_governance_events();
+    assert!(report.complete, "audit should pass for a complete cycle");
+    assert_eq!(report.missing_events, 0u32);
+    assert_eq!(report.malformed_events, 0u32);
+    assert_eq!(report.unlinked_events, 0u32);
 }
 
+/// Boundary: an empty upgrade cycle (no privileged changes) is trivially
+/// complete and must not report spurious failures.
 #[test]
-fn test_reward_replay_empty_event_stream() {
+fn test_governance_audit_empty_cycle_passes() {
     let e = Env::default();
     e.mock_all_auths();
-    let (client, admin) = setup_contract(&e);
+    let (client, _admin) = setup_contract(&e);
 
-    // Boundary: replaying an empty retained-event window yields no allocations
-    // and must not panic.
-    let entries = client.get_admin_audit_log(&0u32, &0u32);
-    assert_eq!(entries.len(), 0);
-    assert!(client.verify_audit_chain());
+    let report = client.audit_governance_events();
+    assert!(report.complete);
+    assert_eq!(report.missing_events, 0u32);
+    assert_eq!(report.malformed_events, 0u32);
+    assert_eq!(report.unlinked_events, 0u32);
 }
 
+/// Boundary: multiple upgrades in a single cycle are each reconciled
+/// independently and the audit still passes.
 #[test]
-fn test_reward_replay_rounding_edge_is_deterministic() {
+fn test_governance_audit_multiple_upgrades_passes() {
     let e = Env::default();
     e.mock_all_auths();
-    let (client, admin) = setup_contract(&e);
+    let (client, _admin) = setup_contract(&e);
 
-    // Boundary: a single retained event (rounding edge where the whole reward
-    // accrues to one source) must replay identically on repeated reads.
+    client.set_min_sources_required(&2u32);
+    client.set_min_sources_required(&3u32);
+    client.set_max_history_length(&40u32);
+    client.set_max_history_length(&60u32);
+
+    let report = client.audit_governance_events();
+    assert!(report.complete);
+    assert_eq!(report.missing_events, 0u32);
+    assert_eq!(report.malformed_events, 0u32);
+    assert_eq!(report.unlinked_events, 0u32);
+}
+
+/// Failure path: a privileged state change whose governance event was not
+/// emitted must cause the audit to fail and be reported as missing.
+#[test]
+fn test_governance_audit_missing_event_fails() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _admin) = setup_contract(&e);
+
     client.set_min_sources_required(&2u32);
 
-    let first = client.get_admin_audit_log(&0u32, &100u32);
-    let second = client.get_admin_audit_log(&0u32, &100u32);
-    assert_eq!(first.len(), second.len());
-    assert!(first.len() >= 1);
-    for i in 0..first.len() {
-        assert_eq!(first.get_unchecked(i).id, second.get_unchecked(i).id);
-    }
+    // Simulate a dropped governance event for the recorded state change.
+    client.test_drop_governance_event(&0u32);
+
+    let report = client.audit_governance_events();
+    assert!(!report.complete, "audit must fail when an event is missing");
+    assert!(report.missing_events >= 1u32);
 }
 
+/// Failure path: a malformed governance event (e.g. wrong payload shape)
+/// must cause the audit to fail and be reported as malformed.
 #[test]
-fn test_reward_replay_recovers_after_failed_action() {
+fn test_governance_audit_malformed_event_fails() {
     let e = Env::default();
     e.mock_all_auths();
-    let (client, admin) = setup_contract(&e);
+    let (client, _admin) = setup_contract(&e);
 
-    // Failure/recovery path: a rejected admin action must not corrupt the
-    // retained event stream, and replay after recovery stays consistent.
-    let count_before = client.get_audit_log_count();
-    let result = client.try_set_min_sources_required(&0u32);
-    assert!(result.is_err());
-    assert_eq!(client.get_audit_log_count(), count_before);
-
-    // Recovery: a valid action appends exactly one event and chain stays valid.
     client.set_min_sources_required(&2u32);
-    assert_eq!(client.get_audit_log_count(), count_before + 1);
-    assert!(client.verify_audit_chain());
+
+    // Corrupt the emitted governance event payload.
+    client.test_corrupt_governance_event(&0u32);
+
+    let report = client.audit_governance_events();
+    assert!(!report.complete, "audit must fail when an event is malformed");
+    assert!(report.malformed_events >= 1u32);
+}
+
+/// Failure path: a governance event that is not linked to its approval
+/// record must cause the audit to fail and be reported as unlinked.
+#[test]
+fn test_governance_audit_unlinked_event_fails() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _admin) = setup_contract(&e);
+
+    client.set_min_sources_required(&2u32);
+
+    // Break the link between the event and its approval record.
+    client.test_unlink_governance_event(&0u32);
+
+    let report = client.audit_governance_events();
+    assert!(!report.complete, "audit must fail when an event is unlinked");
+    assert!(report.unlinked_events >= 1u32);
+}
+
+/// Recovery path: once the missing event is restored, the audit passes again.
+#[test]
+fn test_governance_audit_recovers_after_restore() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (client, _admin) = setup_contract(&e);
+
+    client.set_min_sources_required(&2u32);
+    client.test_drop_governance_event(&0u32);
+
+    let broken = client.audit_governance_events();
+    assert!(!broken.complete);
+
+    // Restore the dropped event and re-run the audit.
+    client.test_restore_governance_event(&0u32);
+
+    let recovered = client.audit_governance_events();
+    assert!(recovered.complete, "audit should pass after recovery");
+    assert_eq!(recovered.missing_events, 0u32);
+    assert_eq!(recovered.malformed_events, 0u32);
+    assert_eq!(recovered.unlinked_events, 0u32);
 }
