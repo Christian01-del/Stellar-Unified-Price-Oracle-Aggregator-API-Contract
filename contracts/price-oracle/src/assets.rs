@@ -9,6 +9,86 @@ use crate::storage::{
 };
 use crate::types::{AssetMetadata, AssetMetadataUpdate, DataKey, ErrorCode, PriceBounds};
 
+/// Asset risk tier used to derive source diversity requirements.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum AssetRiskTier {
+    /// Production / critical assets: strictest diversity requirements.
+    Critical = 0,
+    /// Standard production assets.
+    Standard = 1,
+    /// Lower-risk / test assets: minimal diversity requirements.
+    Low = 2,
+}
+
+impl AssetRiskTier {
+    pub fn from_u32(value: u32) -> Self {
+        match value {
+            0 => AssetRiskTier::Critical,
+            1 => AssetRiskTier::Standard,
+            _ => AssetRiskTier::Low,
+        }
+    }
+
+    /// Minimum number of independent providers required for this tier.
+    pub fn min_providers(self) -> u32 {
+        match self {
+            AssetRiskTier::Critical => 3,
+            AssetRiskTier::Standard => 2,
+            AssetRiskTier::Low => 1,
+        }
+    }
+
+    /// Minimum number of independent operators required for this tier.
+    pub fn min_operators(self) -> u32 {
+        match self {
+            AssetRiskTier::Critical => 2,
+            AssetRiskTier::Standard => 2,
+            AssetRiskTier::Low => 1,
+        }
+    }
+}
+
+/// Source configuration for an asset: the set of independent providers and
+/// operators backing its price feed.
+pub struct SourceDiversityConfig {
+    pub providers: Vec<Address>,
+    pub operators: Vec<Address>,
+}
+
+fn count_unique(env: &Env, addrs: &Vec<Address>) -> u32 {
+    let mut unique: Vec<Address> = Vec::new(env);
+    for i in 0..addrs.len() {
+        let a = addrs.get_unchecked(i);
+        let mut seen = false;
+        for j in 0..unique.len() {
+            if unique.get_unchecked(j) == a {
+                seen = true;
+                break;
+            }
+        }
+        if !seen {
+            unique.push_back(a);
+        }
+    }
+    unique.len()
+}
+
+/// Validate that a source configuration satisfies the diversity rule declared
+/// by the asset's risk tier. Panics with `InvalidConfiguration` when the
+/// configuration fails the rule.
+pub fn check_source_diversity(
+    env: &Env,
+    tier: AssetRiskTier,
+    config: &SourceDiversityConfig,
+) {
+    let providers = count_unique(env, &config.providers);
+    let operators = count_unique(env, &config.operators);
+    if providers < tier.min_providers() || operators < tier.min_operators() {
+        panic_with_error!(env, ErrorCode::InvalidConfiguration);
+    }
+}
+
 pub fn register_asset(env: &Env, asset: Address) {
     let admin = get_admin(env);
     admin.require_auth();
@@ -248,107 +328,6 @@ pub fn set_price_bounds(
 
 pub fn get_price_bounds(env: &Env, asset: Address) -> PriceBounds {
     crate::storage::check_registered_asset(env, &asset);
-    let key = DataKey::AssetPriceBounds(asset.clone());
-    if env.storage().persistent().has(&key) {
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
-    }
-    env.storage().persistent().get(&key).unwrap_or(PriceBounds {
-        min_price: 0,
-        max_price: i128::MAX,
-        max_change_bps_per_ledger: 0,
-    })
-}
+    let key = DataK
 
-pub fn is_asset_paused(env: &Env, asset: &Address) -> bool {
-    let key = DataKey::AssetPauseFlag(asset.clone());
-    if env.storage().persistent().has(&key) {
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
-    }
-    env.storage().persistent().get(&key).unwrap_or(false)
-}
-
-pub fn set_asset_paused(env: &Env, asset: &Address, paused: bool) {
-    let key = DataKey::AssetPauseFlag(asset.clone());
-    env.storage().persistent().set(&key, &paused);
-}
-
-pub fn is_circuit_breaker_tripped(env: &Env, asset: &Address) -> bool {
-    let key = DataKey::AssetCircuitBreakerTripped(asset.clone());
-    if env.storage().persistent().has(&key) {
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, LEDGER_THRESHOLD, LEDGER_BUMP);
-    }
-    env.storage().persistent().get(&key).unwrap_or(false)
-}
-
-pub fn pause_asset(env: &Env, asset: Address) {
-    let admin = get_admin(env);
-    admin.require_auth();
-    crate::storage::check_registered_asset(env, &asset);
-    set_asset_paused(env, &asset, true);
-    emit_admin_action(env, symbol_short!("pause_ast"), admin, Bytes::new(env));
-}
-
-pub fn unpause_asset(env: &Env, asset: Address) {
-    let admin = get_admin(env);
-    admin.require_auth();
-    crate::storage::check_registered_asset(env, &asset);
-    set_asset_paused(env, &asset, false);
-    env.storage()
-        .persistent()
-        .set(&DataKey::AssetCircuitBreakerTripped(asset.clone()), &false);
-    CircuitBreakerResetEvent {
-        asset: asset.clone(),
-        admin: admin.clone(),
-    }
-    .publish(env);
-    emit_admin_action(env, symbol_short!("unp_asts"), admin, Bytes::new(env));
-}
-
-pub fn trip_circuit_breaker(
-    env: &Env,
-    asset: Address,
-    previous_price: i128,
-    candidate_price: i128,
-    change_bps: i128,
-    max_change_bps: u32,
-) {
-    set_asset_paused(env, &asset, true);
-    env.storage()
-        .persistent()
-        .set(&DataKey::AssetCircuitBreakerTripped(asset.clone()), &true);
-
-    let count_key = DataKey::AssetCircuitBreakerLogCount(asset.clone());
-    let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
-    let next_count = count + 1;
-    let entry = CircuitBreakerEventEntry {
-        asset: asset.clone(),
-        previous_price,
-        candidate_price,
-        change_bps: change_bps.min(i128::from(u32::MAX)) as u32,
-        max_change_bps,
-        ledger: env.ledger().sequence(),
-        timestamp: env.ledger().timestamp(),
-    };
-    env.storage().persistent().set(
-        &DataKey::AssetCircuitBreakerLog(asset.clone(), next_count),
-        &entry,
-    );
-    env.storage().persistent().set(&count_key, &next_count);
-
-    CircuitBreakerTrippedEvent {
-        asset: asset.clone(),
-        previous_price,
-        candidate_price,
-        change_bps: entry.change_bps,
-        max_change_bps,
-        ledger: env.ledger().sequence(),
-        timestamp: env.ledger().timestamp(),
-    }
-    .publish(env);
-}
+/* … truncated 3334 chars — edit only what you need near the top … */
